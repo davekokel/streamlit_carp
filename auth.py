@@ -1,129 +1,110 @@
-# auth.py
-# -------------------------------------------------------------------
-# Streamlit + Supabase Auth (invite-friendly)
-# - Magic Link is default (great for first-time invited users)
-# - Forgot-password flow on Password tab
-# - Auto-picks redirect URL via resolve_redirect_url()
-# - Persists session tokens in st.session_state["sb_session"]
-# -------------------------------------------------------------------
+# auth.py (only the auth_ui function shown; keep the rest of your file as-is)
+from __future__ import annotations
 
 import os
 from typing import Optional, Tuple, Dict, Any
 
 import streamlit as st
+import streamlit.components.v1 as components
 from supabase import create_client, Client
 
-
-# ---------- Redirect helper ----------
-
-def resolve_redirect_url() -> str:
-    """
-    URL to redirect back to after auth.
-    Priority:
-      1) st.secrets["PUBLIC_BASE_URL"]
-      2) env PUBLIC_BASE_URL
-      3) fallback: http://localhost:8501
-    Must be allowed in Supabase -> Authentication -> URL Configuration.
-    """
-    url = (
-        (st.secrets.get("PUBLIC_BASE_URL") if hasattr(st, "secrets") else None)
-        or os.environ.get("PUBLIC_BASE_URL")
-        or "http://localhost:8501"
-    )
-    return url.rstrip("/")
-
-
-# ---------- Supabase client helpers ----------
-
-@st.cache_resource
-def get_supabase(anon: bool = True) -> Client:
-    """
-    Returns a Supabase client.
-    - anon=True  -> ANON key (RLS enforced)
-    - anon=False -> SERVICE ROLE key (bypasses RLS; admin-only)
-    """
-    url = os.environ.get("SUPABASE_URL") or st.secrets["SUPABASE_URL"]
-    key = (
-        os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
-        if anon
-        else os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-    )
-    if not url or not key:
-        raise RuntimeError("Missing SUPABASE_URL or API key(s) in env / st.secrets.")
-    return create_client(url, key)
-
-
-def _restore_session(sb: Client) -> Optional[Dict[str, Any]]:
-    """
-    Restore a saved session (if any) and return user dict or None.
-    """
-    try:
-        sess = st.session_state.get("sb_session")
-        if sess:
-            sb.auth.set_session(
-                access_token=sess.get("access_token"),
-                refresh_token=sess.get("refresh_token"),
-            )
-        user = sb.auth.get_user().user
-        if user:
-            return {"id": user.id, "email": user.email}
-    except Exception:
-        pass
-    return None
-
-
-def sign_out(sb: Client) -> None:
-    try:
-        sb.auth.sign_out()
-    finally:
-        st.session_state.pop("sb_session", None)
-
-
-# ---------- Main UI gate ----------
+# ... keep your resolve_redirect_url(), get_supabase(), _restore_session(), sign_out() ...
 
 def auth_ui() -> Tuple[Client, Dict[str, Any]]:
     """
     Blocks with a small auth UI until the user is authenticated.
     Returns (sb_client_with_anon_key, user_dict).
-    user_dict: {"id": <uuid>, "email": <str>}
     """
     sb = get_supabase(anon=True)
 
-    # If we already have a session, restore & return
+    # 1) Try restoring a saved session first
     user = _restore_session(sb)
     if user:
         return sb, user
 
-    # First-time friendly banner
-    st.info(
-        "👋 First time here? If you were invited but haven’t set a password, "
-        "**use the Magic Link tab** below. You can add a password later via “Forgot password”."
+    # 2) CLIENT-SIDE FRAGMENT CATCHER:
+    # If the redirect brought a #access_token hash, grab it and turn into ?access_token=... query params
+    components.html(
+        """
+        <script>
+        (function () {
+          var h = window.location.hash;
+          if (h && h.indexOf("access_token=") !== -1) {
+            var params = new URLSearchParams(h.substring(1));
+            var at = params.get("access_token");
+            var rt = params.get("refresh_token");
+            if (at && rt) {
+              var url = new URL(window.location.href);
+              url.hash = "";  // strip fragment
+              url.searchParams.set("access_token", at);
+              url.searchParams.set("refresh_token", rt);
+              window.location.replace(url.toString());
+            }
+          }
+        })();
+        </script>
+        """,
+        height=0,
     )
 
-    # Make Magic Link the first/default tab
+    # 3) SERVER-SIDE CONSUME TOKENS FROM QUERY PARAMS
+    q = st.query_params
+    at = q.get("access_token")
+    rt = q.get("refresh_token")
+    if at and rt:
+        try:
+            sb.auth.set_session(access_token=at, refresh_token=rt)
+            u = sb.auth.get_user().user
+            if u:
+                # persist for future runs
+                st.session_state["sb_session"] = {"access_token": at, "refresh_token": rt}
+                # clear query params (tidy URL)
+                st.query_params.clear()
+                st.rerun()
+        except Exception as e:
+            st.warning(f"Token exchange failed: {e}")
+
+    # ---- If we get here, still not logged in -> show login UI ----
+    st.info("👋 If you clicked a magic link, you should land here signed in. If not, try the Magic Link tab or enter the 6-digit code from the email.")
+
     tabs = st.tabs(["Magic Link", "Password", "OAuth"])
 
-    # --- Magic Link (invite-friendly, default) ---
+    # --- Magic Link ---
     with tabs[0]:
         st.subheader("Email Magic Link")
-        st.caption("For invited users: no password required.")
         ml_email = st.text_input("Email", key="ml_email")
-        if st.button("Send magic link"):
-            try:
-                redirect_to = resolve_redirect_url()
-                # Important: prevent auto sign-up if you keep invite-only
-                sb.auth.sign_in_with_otp({
-                    "email": ml_email,
-                    "options": {
-                        "email_redirect_to": redirect_to,
-                        "should_create_user": False,
-                    },
-                })
-                st.success("Magic link sent. Check your inbox.")
-            except Exception as e:
-                st.error(f"Magic link failed: {e}")
+        col_ml1, col_ml2 = st.columns([1,1])
+        with col_ml1:
+            if st.button("Send magic link"):
+                try:
+                    sb.auth.sign_in_with_otp({
+                        "email": ml_email,
+                        "options": {
+                            "email_redirect_to": resolve_redirect_url(),
+                            "should_create_user": False,  # invite-only
+                        },
+                    })
+                    st.success("Magic link sent. Check your inbox.")
+                except Exception as e:
+                    st.error(f"Magic link failed: {e}")
+        # OTP fallback: Supabase emails often include a 6-digit code too
+        with col_ml2:
+            code = st.text_input("Enter 6-digit code from email (optional)", max_chars=6)
+            if st.button("Verify code"):
+                try:
+                    res = sb.auth.verify_otp({"email": ml_email, "token": code, "type": "email"})
+                    if res and res.session:
+                        st.session_state["sb_session"] = {
+                            "access_token": res.session.access_token,
+                            "refresh_token": res.session.refresh_token,
+                        }
+                        st.rerun()
+                    else:
+                        st.error("Verification failed. Double-check the code and email.")
+                except Exception as e:
+                    st.error(f"Verify failed: {e}")
 
-    # --- Password Sign-in (with Forgot Password) ---
+    # --- Password Sign-in ---
     with tabs[1]:
         st.subheader("Password Sign in")
         email = st.text_input("Email", key="signin_email")
@@ -139,8 +120,7 @@ def auth_ui() -> Tuple[Client, Dict[str, Any]]:
             except Exception as e:
                 st.error(f"Sign in failed: {e}")
 
-        st.divider()
-        st.caption("Forgot your password? Send a reset link:")
+        st.caption("Forgot password? Send a reset link below.")
         forgot_email = st.text_input("Email for reset link", key="forgot_pw_email")
         if st.button("Send reset link"):
             try:
@@ -148,7 +128,7 @@ def auth_ui() -> Tuple[Client, Dict[str, Any]]:
                     forgot_email,
                     options={"redirect_to": resolve_redirect_url()}
                 )
-                st.success("Password reset email sent. Check your inbox.")
+                st.success("Password reset email sent.")
             except Exception as e:
                 st.error(f"Reset failed: {e}")
 
@@ -178,5 +158,4 @@ def auth_ui() -> Tuple[Client, Dict[str, Any]]:
                 except Exception as e:
                     st.error(f"GitHub OAuth failed: {e}")
 
-    # Halt page rendering until login succeeds
     st.stop()
