@@ -15,9 +15,8 @@ from supabase import create_client, Client
 def resolve_redirect_url() -> str:
     base = os.environ.get("PUBLIC_BASE_URL") or st.secrets.get("PUBLIC_BASE_URL")
     if base:
-        return str(base).rstrip("/") + "/auth-callback"
-    # fallback for local (works with localhost when you paste it into secrets/env)
-    return "/auth-callback"
+        return str(base).rstrip("/") + "/?auth_callback=1"
+    return "/?auth_callback=1"
 
 
 # ------------------------------
