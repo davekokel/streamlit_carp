@@ -1,5 +1,20 @@
-streamlit>=1.36
-pandas>=2.2
-numpy>=1.26
-supabase>=2.6 # official supabase-py v2 client
+# Core
+streamlit>=1.36,<2
+pandas>=2.0,<3
+numpy>=1.26,<2
+
+# Supabase client
+supabase>=2.6  # official supabase-py v2 client
+
+# Env vars
 python-dotenv>=1.0
+
+# Excel support
+xlsxwriter>=3.1,<4
+openpyxl>=3.1,<4
+
+# AgGrid
+streamlit-aggrid==0.3.4.post3
+
+typing-extensions>=4.12   # covers typing helpers, safe to include
+psycopg2-binary>=2.9,<3   # needed if you connect directly to Postgres
