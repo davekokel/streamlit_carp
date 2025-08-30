@@ -27,4 +27,7 @@ Thumbs.db
 .idea/
 
 # Jupyter
-*.ipynb_checkpoints
+*.ipynb_checkpoints.streamlit/secrets.toml
+.env
+.env.*
+*secrets*.toml
