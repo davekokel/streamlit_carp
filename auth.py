@@ -7,6 +7,55 @@ import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
 
+def _password_reset_form(form_key: str, submit_label: str = "Set password") -> Optional[tuple[str, str]]:
+    """
+    Renders a stable form for setting a new password, with Safari-friendly attributes.
+    Returns (pw1, pw2) if submitted, else None.
+    """
+    import streamlit as st
+    import streamlit.components.v1 as components
+
+    # Container so we can scope the JS to just this section
+    container = st.container()
+
+    with container:
+        with st.form(form_key, clear_on_submit=False, border=True):
+            # Avoid the literal word "password" in labels to reduce autofill heuristics
+            pw1 = st.text_input("New passphrase", type="password", key=form_key + "_pw1", placeholder="Enter new passphrase")
+            pw2 = st.text_input("Confirm passphrase", type="password", key=form_key + "_pw2", placeholder="Re-enter new passphrase")
+            submitted = st.form_submit_button(submit_label)
+
+    # Inject a tiny script that marks these as "new-password" fields for Safari
+    # We scope it to the last rendered container using a unique data-attr.
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          try {{
+            // Find the last Streamlit form we rendered (by key suffix)
+            const forms = Array.from(parent.document.querySelectorAll('form'));
+            const target = forms.filter(f => f.innerText.includes('{submit_label}')).slice(-1)[0];
+            if (target) {{
+              const inputs = target.querySelectorAll('input[type="password"]');
+              inputs.forEach((inp, idx) => {{
+                inp.setAttribute('autocomplete', 'new-password');
+                inp.setAttribute('autocorrect', 'off');
+                inp.setAttribute('autocapitalize', 'none');
+                inp.setAttribute('spellcheck', 'false');
+                // Distinct names help password managers avoid pairing them with "current password"
+                inp.setAttribute('name', idx === 0 ? 'new-password' : 'new-password-confirm');
+              }});
+            }}
+          }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+    if 'submitted' in locals() and submitted:
+        return pw1, pw2
+    return None
 
 # =========================
 # Config & client helpers
@@ -199,11 +248,11 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                 if typ == "recovery":
                     # Show the set-password form immediately
                     st.success("You're authenticated to reset your password.")
-                    new1 = st.text_input("New password", type="password")
-                    new2 = st.text_input("Confirm new password", type="password")
-                    if st.button("Set password"):
+                    vals = _password_reset_form("reset_pw_recovery", submit_label="Set password")
+                    if vals:
+                        new1, new2 = vals
                         if not new1 or new1 != new2:
-                            st.error("Passwords don't match.")
+                            st.error("Passphrases don't match.")
                         else:
                             try:
                                 sb.auth.update_user({"password": new1})
@@ -229,29 +278,25 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
 
     # 3) If we already have a valid session AND a post-login prompt, show it now
     def _maybe_prompt_set_password(sb_client: Client) -> None:
-        prompt = st.session_state.get("post_login_prompt")
-        if prompt == "set_password":
-            st.info("For easier sign-in next time, set a password now.")
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                p1 = st.text_input("New password", type="password", key="pw_post_1")
-                p2 = st.text_input("Confirm new password", type="password", key="pw_post_2")
-            with c2:
-                st.write("")  # spacing
-                if st.button("Set password", key="setpw_post"):
-                    if not p1 or p1 != p2:
-                        st.error("Passwords don't match.")
-                    else:
-                        try:
-                            sb_client.auth.update_user({"password": p1})
-                            st.success("Password set. You can now log in with email + password.")
-                            st.session_state.pop("post_login_prompt", None)
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Password update failed: {e}")
-                if st.button("Skip", key="skip_setpw"):
+        st.info("For easier sign-in next time, set a passphrase now.")
+        vals = _password_reset_form("reset_pw_postlogin", submit_label="Set passphrase")
+        c1, c2 = st.columns([3, 1])
+        with c2:
+            if st.button("Skip", key="skip_setpw"):
+                st.session_state.pop("post_login_prompt", None)
+                st.rerun()
+        if vals:
+            p1, p2 = vals
+            if not p1 or p1 != p2:
+                st.error("Passphrases don't match.")
+            else:
+                try:
+                    sb_client.auth.update_user({"password": p1})
+                    st.success("Passphrase set. You can now log in with email + passphrase.")
                     st.session_state.pop("post_login_prompt", None)
                     st.rerun()
+                except Exception as e:
+                    st.error(f"Password update failed: {e}")
 
     # Try to restore session so we can show the prompt in-context
     user = _restore_session(sb)
