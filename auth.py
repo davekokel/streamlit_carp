@@ -1,6 +1,5 @@
 # auth.py
 from __future__ import annotations
-
 from typing import Tuple, Dict, Any, Optional
 import os
 
@@ -14,8 +13,8 @@ from supabase import create_client, Client
 
 def resolve_redirect_url() -> str:
     """
-    Return the redirect target for Supabase magic links / OAuth.
-    We use a query-param callback because Streamlit doesn't serve custom paths.
+    Redirect target for Supabase magic links / OAuth.
+    Use a query-param callback because Streamlit doesn't serve custom paths.
     """
     base = os.environ.get("PUBLIC_BASE_URL") or st.secrets.get("PUBLIC_BASE_URL") or ""
     base = str(base).rstrip("/")
@@ -24,9 +23,7 @@ def resolve_redirect_url() -> str:
 
 @st.cache_resource(show_spinner=False)
 def _make_client(url: str, key: str) -> Client:
-    """
-    Cache keyed by (url, key). Rotating keys yields a new client automatically.
-    """
+    """Cache keyed by (url, key) so rotating keys yields a new client automatically."""
     return create_client(url, key)
 
 
@@ -38,24 +35,22 @@ def get_supabase(anon: bool = True) -> Client:
     url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
     if not url:
         raise RuntimeError("Missing SUPABASE_URL in secrets/env.")
-    if anon:
-        key = os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
-    else:
-        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+    key = (
+        os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
+        if anon else
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+    )
     if not key:
         which = "SUPABASE_ANON_KEY" if anon else "SUPABASE_SERVICE_ROLE_KEY"
         raise RuntimeError(f"Missing {which} in secrets/env.")
     return _make_client(url, key)
-
 
 # =========================
 # Session management
 # =========================
 
 def _restore_session(sb: Client) -> Optional[Dict[str, Any]]:
-    """
-    Restore user from saved tokens in session_state if possible.
-    """
+    """Restore user from saved tokens in session_state if possible."""
     sess = st.session_state.get("sb_session") or {}
     at, rt = sess.get("access_token"), sess.get("refresh_token")
     if not (at and rt):
@@ -66,7 +61,6 @@ def _restore_session(sb: Client) -> Optional[Dict[str, Any]]:
         if u:
             return {"id": u.id, "email": getattr(u, "email", None)}
     except Exception:
-        # Try refresh flow
         try:
             res = sb.auth.refresh_session()
             if res and res.session:
@@ -87,9 +81,7 @@ def _restore_session(sb: Client) -> Optional[Dict[str, Any]]:
 
 
 def sign_out(sb: Client) -> None:
-    """
-    Sign the user out and clear local tokens.
-    """
+    """Sign the user out and clear local tokens."""
     try:
         sb.auth.sign_out()
     except Exception:
@@ -101,7 +93,6 @@ def sign_out(sb: Client) -> None:
         st.query_params.clear()
     except Exception:
         pass
-
 
 # =========================
 # Main gate UI
@@ -118,38 +109,38 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
     if user:
         return sb, user
 
-    # 2) Client-side fragment catcher -> query params (works with Streamlit)
-    #    If link arrives like .../?auth_callback=1#access_token=...,
-    #    we convert it to .../?auth_callback=1&access_token=... then reload once.
+    # 2) Client-side fragment catcher -> query params
     components.html(
-        f"""
+        """
         <script>
-        (function () {{
-          try {{
+        (function () {
+          try {
             var h = window.location.hash;
-            if (h && h.indexOf("access_token=") !== -1) {{
+            if (h && h.indexOf("access_token=") !== -1) {
               var params = new URLSearchParams(h.substring(1));
               var at = params.get("access_token");
               var rt = params.get("refresh_token");
-              if (at && rt) {{
+              var typ = params.get("type"); // include recovery type
+              if (at && rt) {
                 var url = new URL(window.location.href);
                 url.hash = "";
-                if (!url.searchParams.get("access_token")) {{
+                if (!url.searchParams.get("access_token")) {
                   url.searchParams.set("access_token", at);
                   url.searchParams.set("refresh_token", rt);
+                  if (typ) url.searchParams.set("type", typ);
                   window.location.replace(url.toString());
                   return;
-                }}
-              }}
-            }}
-          }} catch (e) {{}}
-        }})();
+                }
+              }
+            }
+          } catch (e) {}
+        })();
         </script>
         """,
         height=0,
     )
 
-    # Optional tiny debug readout (turn on by passing debug=True)
+    # Debug readout (optional)
     if debug:
         components.html(
             """
@@ -163,14 +154,34 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
             height=50,
         )
 
-    # 3) Server-side: consume query tokens
+    # 3) Server-side: consume query tokens (and handle password recovery)
     q = st.query_params
-    at, rt = q.get("access_token"), q.get("refresh_token")
+    at, rt, typ = q.get("access_token"), q.get("refresh_token"), q.get("type")
+
     if at and rt:
         try:
             sb.auth.set_session(access_token=at, refresh_token=rt)
             u = sb.auth.get_user().user
             if u:
+                # Recovery flow: let the user set a new password now
+                if typ == "recovery":
+                    st.success("You're authenticated to reset your password.")
+                    new1 = st.text_input("New password", type="password")
+                    new2 = st.text_input("Confirm new password", type="password")
+                    if st.button("Set password"):
+                        if not new1 or new1 != new2:
+                            st.error("Passwords don't match.")
+                        else:
+                            try:
+                                sb.auth.update_user({"password": new1})
+                                st.query_params.clear()
+                                st.success("Password updated. You're signed in.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Password update failed: {e}")
+                    st.stop()  # Stay on this form until password is set
+
+                # Normal magic-link path
                 st.session_state["sb_session"] = {"access_token": at, "refresh_token": rt}
                 st.query_params.clear()
                 st.rerun()
@@ -199,7 +210,7 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                         "email": ml_email,
                         "options": {
                             "email_redirect_to": resolve_redirect_url(),
-                            # If you run invite-only, set False and ensure the user exists first.
+                            # If you run invite-only, set False and ensure user exists first.
                             "should_create_user": True,
                         },
                     })
@@ -233,8 +244,7 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                         u = sb.auth.get_user().user
                         if u:
                             st.session_state["sb_session"] = {
-                                "access_token": pat,
-                                "refresh_token": prt,
+                                "access_token": pat, "refresh_token": prt
                             }
                             st.success("Signed in!")
                             st.rerun()
@@ -262,14 +272,14 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                 st.error(f"Sign in failed: {e}")
 
         st.caption("Forgot password? Send a reset link below.")
-        reset_email = st.text_input("Email for reset link", key="reset_email")
+        reset_email = st.text_input("Email for reset link")
         if st.button("Send reset link"):
             try:
                 sb.auth.reset_password_email(
                     reset_email,
                     options={"redirect_to": resolve_redirect_url()}
                 )
-                st.success("Password reset email sent.")
+                st.success("Password reset email sent. Click it and set a new password.")
             except Exception as e:
                 st.error(f"Reset failed: {e}")
 
