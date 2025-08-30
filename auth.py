@@ -293,53 +293,139 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
             st.caption("Paste the FULL magic-link URL if it opened in another app/browser:")
             pasted = st.text_input(
                 "Paste URL (we'll extract access_token automatically)",
-                placeholder="https://…/ ?auth_callback=1#access_token=…&refresh_token=…&type=recovery"
+                placeholder="https://…/?auth_callback=1#access_token=…&refresh_token=…&type=recovery"
             )
             if st.button("Use pasted link"):
-                from urllib.parse import urlparse, parse_qs
-                pat = prt = ptyp = None
-                try:
-                    if pasted:
-                        u = urlparse(pasted)
-                        # Prefer fragment (hash), then fall back to querystring
+                from urllib.parse import urlparse, parse_qs, unquote
+                import re
+
+                def _extract_tokens_from_any(s: str):
+                    """Return (access_token, refresh_token, type_or_codeflag) or (None,None,None)."""
+                    if not s:
+                        return None, None, None
+
+                    # Iteratively decode common encodings (SafeLinks, %23 fragments, etc.)
+                    dec = s.strip()
+                    for _ in range(3):
+                        new = unquote(dec)
+                        if new == dec:
+                            break
+                        dec = new
+
+                    # Try standard parse on the string as a URL (with nested unwrapping)
+                    def _from_urlstring(url_s: str):
+                        at = rt = typ = None
+                        u = urlparse(url_s)
+
+                        # Prefer fragment first (#access_token=…)
                         if u.fragment:
                             frag = parse_qs(u.fragment)
-                            pat  = (frag.get("access_token") or [None])[0]
-                            prt  = (frag.get("refresh_token") or [None])[0]
-                            ptyp = (frag.get("type") or [None])[0]
-                        if not pat or not prt:
-                            qs = parse_qs(u.query or "")
-                            pat  = pat  or (qs.get("access_token") or [None])[0]
-                            prt  = prt  or (qs.get("refresh_token") or [None])[0]
-                            ptyp = ptyp or (qs.get("type") or [None])[0]
+                            at  = (frag.get("access_token") or [None])[0]
+                            rt  = (frag.get("refresh_token") or [None])[0]
+                            typ = (frag.get("type") or [None])[0]
+
+                        # Fall back to query (?access_token=…)
+                        if (not at or not rt) and (u.query):
+                            qs = parse_qs(u.query)
+                            at  = at  or (qs.get("access_token") or [None])[0]
+                            rt  = rt  or (qs.get("refresh_token") or [None])[0]
+                            typ = typ or (qs.get("type") or [None])[0]
+
+                        # Look for nested URLs in query values (SafeLinks wrappers)
+                        if (not at or not rt) and u.query:
+                            qs = parse_qs(u.query)
+                            for values in qs.values():
+                                for val in values:
+                                    if "http" in val or "%3A%2F%2F" in val:
+                                        a2, r2, t2 = _from_urlstring(unquote(val))
+                                        if a2 and r2:
+                                            return a2, r2, t2
+                        return at, rt, typ
+
+                    at, rt, typ = _from_urlstring(dec)
+
+                    # Regex fallback anywhere in the string
+                    if not (at and rt):
+                        m = re.search(r'(?:[#?&])access_token=([^&#\s]+)', dec)
+                        n = re.search(r'(?:[#?&])refresh_token=([^&#\s]+)', dec)
+                        t = re.search(r'(?:[#?&])type=([^&#\s]+)', dec)
+                        at = at or (m.group(1) if m else None)
+                        rt = rt or (n.group(1) if n else None)
+                        typ = typ or (t.group(1) if t else None)
+
+                    # If still nothing, maybe it’s a PKCE-style link with ?code=…
+                    if not (at and rt):
+                        u = urlparse(dec)
+                        code = None
+                        if u.fragment:
+                            code = (parse_qs(u.fragment).get("code") or [None])[0]
+                        if not code and u.query:
+                            code = (parse_qs(u.query).get("code") or [None])[0]
+                        if not code and "code=" in dec:
+                            m = re.search(r'(?:[#?&])code=([^&#\s]+)', dec)
+                            code = m.group(1) if m else None
+                        return at, rt, (typ or ("code:"+code if code else None))
+
+                    return at, rt, typ
+
+                try:
+                    pat, prt, ptyp = _extract_tokens_from_any(pasted)
+
+                    # If we got access/refresh tokens, use them
                     if pat and prt:
-                        sb.auth.set_session(access_token=pat, refresh_token=prt)
-                        u = sb.auth.get_user().user
-                        if u:
-                            if ptyp == "recovery":
-                                st.success("You're authenticated to reset your password.")
-                                n1 = st.text_input("New password", type="password", key="newpw1")
-                                n2 = st.text_input("Confirm new password", type="password", key="newpw2")
-                                if st.button("Set password", key="setpw_paste"):
-                                    if not n1 or n1 != n2:
-                                        st.error("Passwords don't match.")
-                                    else:
-                                        try:
-                                            sb.auth.update_user({"password": n1})
-                                            st.success("Password updated. You're signed in.")
-                                            st.rerun()
-                                        except Exception as e:
-                                            st.error(f"Password update failed: {e}")
-                                st.stop()
-                            # magiclink from pasted URL -> prompt on next run
-                            st.session_state["post_login_prompt"] = "set_password"
-                            st.session_state["sb_session"] = {"access_token": pat, "refresh_token": prt}
-                            st.success("Signed in!")
-                            st.rerun()
-                        else:
-                            st.error("Tokens parsed but no user returned—likely expired/used.")
-                    else:
-                        st.error("No access_token/refresh_token found in that URL.")
+                        try:
+                            sb.auth.set_session(access_token=pat, refresh_token=prt)
+                            u = sb.auth.get_user().user
+                            if u:
+                                if ptyp == "recovery":
+                                    st.success("You're authenticated to reset your password.")
+                                    n1 = st.text_input("New password", type="password", key="newpw1")
+                                    n2 = st.text_input("Confirm new password", type="password", key="newpw2")
+                                    if st.button("Set password", key="setpw_paste"):
+                                        if not n1 or n1 != n2:
+                                            st.error("Passwords don't match.")
+                                        else:
+                                            try:
+                                                sb.auth.update_user({"password": n1})
+                                                st.success("Password updated. You're signed in.")
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(f"Password update failed: {e}")
+                                    st.stop()
+                                # magiclink from pasted URL -> prompt on next run
+                                st.session_state["post_login_prompt"] = "set_password"
+                                st.session_state["sb_session"] = {"access_token": pat, "refresh_token": prt}
+                                st.success("Signed in!")
+                                st.rerun()
+                            else:
+                                st.error("Tokens parsed but no user returned—likely expired/used.")
+                        except Exception as e:
+                            st.error(f"Token import failed: {e}")
+                        st.stop()
+
+                    # If it looks like a PKCE code link, try exchanging the code
+                    if ptyp and isinstance(ptyp, str) and ptyp.startswith("code:"):
+                        code = ptyp.split(":", 1)[1]
+                        if code:
+                            try:
+                                # Some supabase-py versions expose exchange_code_for_session
+                                res = sb.auth.exchange_code_for_session({"code": code})  # may vary by version
+                                if res and res.session:
+                                    st.session_state["sb_session"] = {
+                                        "access_token": res.session.access_token,
+                                        "refresh_token": res.session.refresh_token,
+                                    }
+                                    st.success("Signed in with code exchange!")
+                                    st.rerun()
+                                else:
+                                    st.error("Code exchange returned no session (version mismatch or expired code).")
+                            except AttributeError:
+                                st.error("Your Supabase client doesn’t support code exchange; update supabase-py.")
+                            except Exception as e:
+                                st.error(f"Code exchange failed: {e}")
+                            st.stop()
+
+                    st.error("No access_token/refresh_token (or code) found in that URL.")
                 except Exception as e:
                     st.error(f"Token import failed: {e}")
 
