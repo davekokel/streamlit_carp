@@ -1,14 +1,18 @@
 # pages/fish_view_aggrid_feature_summary_linked.py
 # ------------------------------------------------------------
+# Auth-protected user page (RLS enforced via anon client from auth.py)
 # Requirements:
 #   pip install streamlit-aggrid
 #   (and in requirements.txt: streamlit-aggrid)
 # ------------------------------------------------------------
-import os
+from __future__ import annotations
+
 import pandas as pd
 import streamlit as st
-from supabase import create_client
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+
+# --- Auth gate (uses anon client; RLS applies) ---
+from auth import auth_ui, sign_out
 
 # ------------------------------
 # Page config
@@ -16,15 +20,16 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 st.set_page_config(page_title="Fish (Feature Summary from Links)", page_icon="🐟", layout="wide")
 st.title("🐟 Fish — Feature Summary (from linked tables)")
 
-# ------------------------------
-# Supabase client (service role)
-# ------------------------------
-SUPABASE_URL = st.secrets.get("SUPABASE_URL")
-SERVICE_ROLE_KEY = st.secrets.get("SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-if not SUPABASE_URL or not SERVICE_ROLE_KEY:
-    st.error("Missing SUPABASE_URL or SERVICE_ROLE_KEY in .streamlit/secrets.toml")
-    st.stop()
-sb = create_client(SUPABASE_URL, SERVICE_ROLE_KEY)
+# Block until signed in; returns anon-key Supabase client (RLS) + user dict
+sb, user = auth_ui()
+
+# Optional sign-out on this page
+with st.sidebar:
+    st.markdown("**Session**")
+    st.caption(f"Signed in as **{user['email']}**")
+    if st.button("Sign out"):
+        sign_out(sb)
+        st.rerun()
 
 # ------------------------------
 # Session state (for parent selection)
@@ -38,9 +43,15 @@ if "parent_father_id" not in st.session_state:
 # Helpers
 # ------------------------------
 @st.cache_data(ttl=60)
-def fetch_fish(limit=500) -> pd.DataFrame:
+def fetch_fish(limit: int = 500) -> pd.DataFrame:
     try:
-        resp = sb.table("fish").select("*").order("created_at", desc=True).limit(limit).execute()
+        resp = (
+            sb.table("fish")
+              .select("*")
+              .order("created_at", desc=True)
+              .limit(limit)
+              .execute()
+        )
         return pd.DataFrame(resp.data or [])
     except Exception as e:
         st.error(f"Error fetching fish: {e}")
@@ -60,7 +71,7 @@ def _uniq_preserve(seq):
 
 def global_filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
     """Case-insensitive literal substring match across ALL columns."""
-    if not query.strip():
+    if not (query or "").strip():
         return df
     mask = df.astype(str).apply(lambda s: s.str.contains(query, case=False, na=False, regex=False))
     return df[mask.any(axis=1)]
@@ -68,9 +79,11 @@ def global_filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
 # ---- Linked fetchers (return lists of dicts) ----
 @st.cache_data(ttl=60)
 def linked_transgenes(fish_id: int) -> list[dict]:
-    r = (sb.table("fish_transgenes")
-           .select("transgenes(id,name,plasmid_id,notes,plasmids(name,marker,resistance))")
-           .eq("fish_id", fish_id).execute())
+    r = (
+        sb.table("fish_transgenes")
+          .select("transgenes(id,name,plasmid_id,notes,plasmids(name,marker,resistance))")
+          .eq("fish_id", fish_id).execute()
+    )
     rows = r.data or []
     out = []
     for row in rows:
@@ -159,10 +172,12 @@ def build_feature_row(row_dict: dict) -> dict:
     if fid is None:
         out.update({"transgenes": "", "mutations": "", "treatments": "", "strains": ""})
         return out
+
     tg_rows = linked_transgenes(int(fid))
     mu_rows = linked_mutations(int(fid))
     tr_rows = linked_treatments(int(fid))
     stn_rows = linked_strains(int(fid))
+
     out.update({
         "transgenes": fmt_transgenes(tg_rows),
         "mutations": fmt_mutations(mu_rows),
@@ -193,7 +208,7 @@ filtered = df.copy()
 filtered = global_filter_df(filtered, global_q)
 
 # Then apply specific column filters (optional, additive)
-if name_filter:
+if name_filter and "name" in filtered.columns:
     filtered = filtered[filtered["name"].str.contains(name_filter, case=False, na=False)]
 if stage_filter and "line_building_stage" in filtered.columns:
     filtered = filtered[filtered["line_building_stage"].str.contains(stage_filter, case=False, na=False)]
@@ -245,7 +260,6 @@ elif len(selected_rows) > 2:
     st.error("Please select **exactly two** fish to assign parents.")
 else:
     # Exactly two selected
-    # Build choices: (label -> id)
     def label_for(r: dict) -> str:
         rid = r.get("id")
         nm = r.get("name") or f"Fish {rid}"
@@ -256,12 +270,10 @@ else:
 
     options = {label_for(r): r.get("id") for r in selected_rows}
 
-    # Default mother/father choice
     ids = list(options.values())
     default_mother = st.session_state.parent_mother_id or (ids[0] if ids else None)
     default_father = st.session_state.parent_father_id or (ids[1] if len(ids) > 1 else None)
-    if default_mother == default_father:
-        # ensure they differ
+    if default_mother == default_father and len(ids) == 2:
         default_mother, default_father = ids[0], ids[1]
 
     c1, c2, c3 = st.columns([1.2, 1.2, 0.6])
@@ -274,7 +286,6 @@ else:
         )
         chosen_mother_id = options[mother_label]
     with c2:
-        # Filter father choices to not duplicate mother
         father_choices = {k: v for k, v in options.items() if v != chosen_mother_id}
         father_label = st.selectbox(
             "Father",
@@ -285,19 +296,16 @@ else:
         chosen_father_id = father_choices[father_label]
     with c3:
         if st.button("↔️ Swap"):
-            # swap selection quickly
-            mother_label, father_label = father_label, mother_label
-            chosen_mother_id, chosen_father_id = chosen_father_id, options[mother_label]  # fix after swap
-            # persist swap
-            st.session_state.parent_mother_id = chosen_mother_id
-            st.session_state.parent_father_id = options[father_label]
-            st.rerun()
+            st.session_state.parent_mother_id = chosen_father_id
+            st.session_state.parent_father_id = chosen_mother_id
+            try:
+                st.rerun()
+            except AttributeError:
+                st.experimental_rerun()
 
-    # Persist chosen parents
     st.session_state.parent_mother_id = chosen_mother_id
     st.session_state.parent_father_id = chosen_father_id
 
-    # Pretty summary
     def row_by_id(fid: int) -> dict:
         for r in selected_rows:
             if r.get("id") == fid:
@@ -311,7 +319,6 @@ else:
         f"**Father**: {frow.get('name', '—')} (id={chosen_father_id})"
     )
 
-    # Optional: expose IDs for downstream pages / copy-paste
     with st.expander("Parent IDs (for use elsewhere)"):
         st.code(
             {
@@ -321,6 +328,9 @@ else:
             language="json",
         )
 
+# ------------------------------
+# Feature Summary (from linked tables)
+# ------------------------------
 st.divider()
 st.subheader("🐟 Feature Summary (from linked tables)")
 

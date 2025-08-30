@@ -1,14 +1,18 @@
 # pages/fish_view_aggrid_feature_summary_linked.py
 # ------------------------------------------------------------
+# Auth-protected user page (RLS enforced via anon client from auth.py)
 # Requirements:
 #   pip install streamlit-aggrid
 #   (and in requirements.txt: streamlit-aggrid)
 # ------------------------------------------------------------
-import os
+from __future__ import annotations
+
 import pandas as pd
 import streamlit as st
-from supabase import create_client
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+
+# --- Auth gate (uses anon client; RLS applies) ---
+from auth import auth_ui, sign_out
 
 # ------------------------------
 # Page config
@@ -16,24 +20,31 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 st.set_page_config(page_title="Fish (Feature Summary from Links)", page_icon="🐟", layout="wide")
 st.title("🐟 Fish — Feature Summary (from linked tables)")
 
-# ------------------------------
-# Supabase client (service role)
-# ------------------------------
-SUPABASE_URL = st.secrets.get("SUPABASE_URL")
-SERVICE_ROLE_KEY = st.secrets.get("SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-if not SUPABASE_URL or not SERVICE_ROLE_KEY:
-    st.error("Missing SUPABASE_URL or SERVICE_ROLE_KEY in .streamlit/secrets.toml")
-    st.stop()
-sb = create_client(SUPABASE_URL, SERVICE_ROLE_KEY)
+# Block until signed in; returns anon-key Supabase client (RLS) + user dict
+sb, user = auth_ui()
+
+# Optional sign-out on this page
+with st.sidebar:
+    st.markdown("**Session**")
+    st.caption(f"Signed in as **{user['email']}**")
+    if st.button("Sign out"):
+        sign_out(sb)
+        st.rerun()
 
 # ------------------------------
 # Helpers
 # ------------------------------
 @st.cache_data(ttl=60)
-def fetch_fish(limit=500) -> pd.DataFrame:
-    """Fetch fish from Supabase"""
+def fetch_fish(limit: int = 500) -> pd.DataFrame:
+    """Fetch fish from Supabase (RLS applies)."""
     try:
-        resp = sb.table("fish").select("*").order("created_at", desc=True).limit(limit).execute()
+        resp = (
+            sb.table("fish")
+              .select("*")
+              .order("created_at", desc=True)
+              .limit(limit)
+              .execute()
+        )
         return pd.DataFrame(resp.data or [])
     except Exception as e:
         st.error(f"Error fetching fish: {e}")
@@ -53,7 +64,7 @@ def _uniq_preserve(seq):
 
 def global_filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
     """Case-insensitive literal substring match across ALL columns."""
-    if not query.strip():
+    if not (query or "").strip():
         return df
     mask = df.astype(str).apply(lambda s: s.str.contains(query, case=False, na=False, regex=False))
     return df[mask.any(axis=1)]
@@ -68,7 +79,7 @@ def linked_transgenes(fish_id: int) -> list[dict]:
           .execute()
     )
     rows = r.data or []
-    out = []
+    out: list[dict] = []
     for row in rows:
         tg = row.get("transgenes") or {}
         pl = tg.get("plasmids") or {}
@@ -89,7 +100,7 @@ def linked_mutations(fish_id: int) -> list[dict]:
           .eq("fish_id", fish_id).execute()
     )
     rows = r.data or []
-    return [{"name": (mu.get("name")), "gene": mu.get("gene"), "notes": mu.get("notes")}
+    return [{"name": mu.get("name"), "gene": mu.get("gene"), "notes": mu.get("notes")}
             for row in rows for mu in [row.get("mutations") or {}]]
 
 @st.cache_data(ttl=60)
@@ -186,7 +197,7 @@ stage_filter = st.sidebar.text_input("Line building stage contains")
 filtered = df.copy()
 filtered = global_filter_df(filtered, global_q)
 
-if name_filter:
+if name_filter and "name" in filtered.columns:
     filtered = filtered[filtered["name"].str.contains(name_filter, case=False, na=False)]
 if stage_filter and "line_building_stage" in filtered.columns:
     filtered = filtered[filtered["line_building_stage"].str.contains(stage_filter, case=False, na=False)]

@@ -1,8 +1,22 @@
+# pages/erd_mermaid.py  (or keep your filename)
+from __future__ import annotations
+
 import streamlit as st
 import streamlit.components.v1 as components
+from auth import auth_ui, sign_out  # ✅ gate with your auth
 
+# ---- Auth gate (blocks until signed in) ----
+sb, user = auth_ui()
+
+# ---- Page config / header ----
 st.set_page_config(page_title="Mermaid ERD", layout="wide")
 st.title("🐟 Database ER Diagram")
+
+with st.sidebar:
+    st.caption(f"Signed in as **{user['email']}**")
+    if st.button("Sign out"):
+        sign_out(sb)
+        st.rerun()
 
 # Put ONLY Mermaid code here (no ```mermaid fences)
 mermaid_erd = """

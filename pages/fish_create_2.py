@@ -1,31 +1,36 @@
 # pages/fish_view_aggrid_feature_summary_linked.py
 # ------------------------------------------------------------
-# Requirements:
+# Auth-protected user page (RLS enforced via anon client from auth.py)
+# Requires:
 #   pip install streamlit-aggrid
 #   (and in requirements.txt: streamlit-aggrid)
 # ------------------------------------------------------------
+from __future__ import annotations
+
 import os
+from typing import Optional, List, Dict
+
 import pandas as pd
 import streamlit as st
-from supabase import create_client
 from postgrest.exceptions import APIError
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
-# ------------------------------
-# Page config
-# ------------------------------
+# --- Auth gate (uses anon client; RLS applies) ---
+from auth import auth_ui, sign_out
+
 st.set_page_config(page_title="Fish (Feature Summary from Links)", page_icon="🐟", layout="wide")
 st.title("🐟 Fish — Feature Summary (from linked tables)")
 
-# ------------------------------
-# Supabase client (service role)
-# ------------------------------
-SUPABASE_URL = st.secrets.get("SUPABASE_URL")
-SERVICE_ROLE_KEY = st.secrets.get("SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-if not SUPABASE_URL or not SERVICE_ROLE_KEY:
-    st.error("Missing SUPABASE_URL or SERVICE_ROLE_KEY in .streamlit/secrets.toml")
-    st.stop()
-sb = create_client(SUPABASE_URL, SERVICE_ROLE_KEY)
+# Block until signed in; returns anon-key client (RLS) + user dict
+sb, user = auth_ui()
+
+# Optional sign out on this page
+with st.sidebar:
+    st.markdown("**Session**")
+    st.caption(f"Signed in as **{user['email']}**")
+    if st.button("Sign out"):
+        sign_out(sb)
+        st.rerun()
 
 # ------------------------------
 # Session state (for parent selection & entry buffer)
@@ -39,7 +44,7 @@ if "parent_father_id" not in st.session_state:
 # Helpers
 # ------------------------------
 @st.cache_data(ttl=60)
-def fetch_fish(limit=500) -> pd.DataFrame:
+def fetch_fish(limit: int = 500) -> pd.DataFrame:
     try:
         resp = sb.table("fish").select("*").order("created_at", desc=True).limit(limit).execute()
         return pd.DataFrame(resp.data or [])
@@ -61,27 +66,27 @@ def _uniq_preserve(seq):
 
 def global_filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
     """Case-insensitive literal substring match across ALL columns."""
-    if not query.strip():
+    if not (query or "").strip():
         return df
     mask = df.astype(str).apply(lambda s: s.str.contains(query, case=False, na=False, regex=False))
     return df[mask.any(axis=1)]
 
 # ---- Linked fetchers (return lists of dicts) ----
 @st.cache_data(ttl=60)
-def linked_transgenes(fish_id: int) -> list[dict]:
+def linked_transgenes(fish_id: int) -> List[Dict]:
     r = (
         sb.table("fish_transgenes")
           .select("transgenes(id,name,plasmid_id,notes,plasmids(name,marker,resistance))")
           .eq("fish_id", fish_id).execute()
     )
     rows = r.data or []
-    out = []
+    out: List[Dict] = []
     for row in rows:
         tg = row.get("transgenes") or {}
         pl = tg.get("plasmids") or {}
         out.append({
             "name": tg.get("name"),
-            "transgene_notes": tg.get("notes"),   # <-- pull notes from transgenes
+            "transgene_notes": tg.get("notes"),   # <-- notes from transgenes
             "plasmid_name": pl.get("name"),
             "marker": pl.get("marker"),
             "resistance": pl.get("resistance"),
@@ -89,44 +94,47 @@ def linked_transgenes(fish_id: int) -> list[dict]:
     return out
 
 @st.cache_data(ttl=60)
-def linked_mutations(fish_id: int) -> list[dict]:
+def linked_mutations(fish_id: int) -> List[Dict]:
     r = (sb.table("fish_mutations")
            .select("mutations(id,name,gene,notes)")
            .eq("fish_id", fish_id).execute())
     rows = r.data or []
-    out = []
+    out: List[Dict] = []
     for row in rows:
         mu = row.get("mutations") or {}
         out.append({"name": mu.get("name"), "gene": mu.get("gene"), "notes": mu.get("notes")})
     return out
 
 @st.cache_data(ttl=60)
-def linked_treatments(fish_id: int) -> list[dict]:
+def linked_treatments(fish_id: int) -> List[Dict]:
     r = (sb.table("fish_treatments")
            .select("treatments(id,treatment_type,treatment_name,notes)")
            .eq("fish_id", fish_id).execute())
     rows = r.data or []
-    out = []
+    out: List[Dict] = []
     for row in rows:
         tr = row.get("treatments") or {}
-        out.append({"treatment_type": tr.get("treatment_type"), "treatment_name": tr.get("treatment_name"), "notes": tr.get("notes")})
+        out.append({
+            "treatment_type": tr.get("treatment_type"),
+            "treatment_name": tr.get("treatment_name"),
+            "notes": tr.get("notes"),
+        })
     return out
 
 @st.cache_data(ttl=60)
-def linked_strains(fish_id: int) -> list[dict]:
+def linked_strains(fish_id: int) -> List[Dict]:
     r = (sb.table("fish_strains")
            .select("strains(id,name,notes)")
            .eq("fish_id", fish_id).execute())
     rows = r.data or []
-    out = []
+    out: List[Dict] = []
     for row in rows:
         stn = row.get("strains") or {}
         out.append({"name": stn.get("name"), "notes": stn.get("notes")})
     return out
 
 # ---- Formatters ----
-def fmt_transgene_notes(rows: list[dict]) -> str:
-    """Return 'TransgeneName: note' for each linked transgene with notes."""
+def fmt_transgene_notes(rows: List[Dict]) -> str:
     parts = []
     for r in rows:
         name = (r.get("name") or "").strip()
@@ -135,14 +143,14 @@ def fmt_transgene_notes(rows: list[dict]) -> str:
             parts.append(f"{name + ': ' if name else ''}{note}")
     return "; ".join(_uniq_preserve(parts))
 
-def fmt_mutations(rows: list[dict]) -> str:
+def fmt_mutations(rows: List[Dict]) -> str:
     parts = []
     for r in rows:
         name = r.get("name"); gene = r.get("gene")
         parts.append(name if not gene else f"{name} ({gene})")
     return "; ".join(_uniq_preserve(parts))
 
-def fmt_treatments(rows: list[dict]) -> str:
+def fmt_treatments(rows: List[Dict]) -> str:
     parts = []
     for r in rows:
         t = r.get("treatment_type"); n = r.get("treatment_name")
@@ -151,24 +159,19 @@ def fmt_treatments(rows: list[dict]) -> str:
         elif t: parts.append(str(t))
     return "; ".join(_uniq_preserve(parts))
 
-def fmt_strains(rows: list[dict]) -> str:
+def fmt_strains(rows: List[Dict]) -> str:
     return "; ".join(_uniq_preserve([r.get("name") for r in rows if r.get("name")]))
 
-def build_feature_row(row_dict: dict) -> dict:
+def build_feature_row(row_dict: Dict) -> Dict:
     fid = row_dict.get("id")
-    out = {
+    out: Dict = {
         "id": row_dict.get("id"),
         "name": row_dict.get("name"),
         "date_birth": row_dict.get("date_birth"),
         "line_building_stage": row_dict.get("line_building_stage"),
     }
     if fid is None:
-        out.update({
-            "transgene_notes": "",  # only transgene notes (no 'transgenes' column)
-            "mutations": "",
-            "treatments": "",
-            "strains": "",
-        })
+        out.update({"transgene_notes": "", "mutations": "", "treatments": "", "strains": ""})
         return out
 
     tg_rows = linked_transgenes(int(fid))
@@ -184,9 +187,8 @@ def build_feature_row(row_dict: dict) -> dict:
     })
     return out
 
-
 # ---- DB helpers: find/create & safe links ----
-def _find_one(table: str, filters: dict, select_cols: str = "id"):
+def _find_one(table: str, filters: Dict, select_cols: str = "id"):
     q = sb.table(table).select(select_cols)
     for k, v in filters.items():
         q = q.eq(k, v)
@@ -194,12 +196,12 @@ def _find_one(table: str, filters: dict, select_cols: str = "id"):
     rows = res.data or []
     return rows[0] if rows else None
 
-def _insert_returning_id(table: str, payload: dict) -> int | None:
+def _insert_returning_id(table: str, payload: Dict) -> Optional[int]:
     res = sb.table(table).insert(payload).execute()
     row = (res.data or [{}])[0]
     return row.get("id")
 
-def get_or_create_by_name(table: str, name_field: str, name_val: str, extra: dict | None = None) -> int | None:
+def get_or_create_by_name(table: str, name_field: str, name_val: str, extra: Optional[Dict] = None) -> Optional[int]:
     """Simple name-based upsert for lookup tables (mutations, transgenes, strains)."""
     if not name_val:
         return None
@@ -211,7 +213,7 @@ def get_or_create_by_name(table: str, name_field: str, name_val: str, extra: dic
         payload.update(extra)
     return _insert_returning_id(table, payload)
 
-def get_or_create_treatment(treatment_type: str | None, treatment_name: str | None, notes: str | None) -> int | None:
+def get_or_create_treatment(treatment_type: Optional[str], treatment_name: Optional[str], notes: Optional[str]) -> Optional[int]:
     """Match on (treatment_type, treatment_name)."""
     if not treatment_name and not treatment_type:
         return None
@@ -226,10 +228,8 @@ def get_or_create_treatment(treatment_type: str | None, treatment_name: str | No
     payload = {"treatment_type": treatment_type, "treatment_name": treatment_name, "notes": notes}
     return _insert_returning_id("treatments", payload)
 
-def safe_link_upsert(table: str, payload: dict, on_conflict: str):
-    """
-    Upsert a join row (e.g., fish_mutations) using on_conflict to avoid duplicate key errors.
-    """
+def safe_link_upsert(table: str, payload: Dict, on_conflict: str):
+    """Upsert a join row (e.g., fish_mutations) using on_conflict to avoid duplicate key errors."""
     try:
         sb.table(table).upsert(payload, on_conflict=on_conflict).execute()
     except APIError as e:
@@ -253,7 +253,7 @@ stage_filter = st.sidebar.text_input("Line building stage contains")
 
 filtered = df.copy()
 filtered = global_filter_df(filtered, global_q)
-if name_filter:
+if name_filter and "name" in filtered.columns:
     filtered = filtered[filtered["name"].str.contains(name_filter, case=False, na=False)]
 if stage_filter and "line_building_stage" in filtered.columns:
     filtered = filtered[filtered["line_building_stage"].str.contains(stage_filter, case=False, na=False)]
@@ -304,8 +304,7 @@ elif len(selected_rows) == 1:
 elif len(selected_rows) > 2:
     st.error("Please select **exactly two** fish to assign parents.")
 else:
-    # Exactly two selected
-    def label_for(r: dict) -> str:
+    def label_for(r: Dict) -> str:
         rid = r.get("id")
         nm = r.get("name") or f"Fish {rid}"
         stage = r.get("line_building_stage") or ""
@@ -314,8 +313,8 @@ else:
         return f"{nm} [id={rid}]" if not meta else f"{nm} [id={rid}] — {meta}"
 
     options = {label_for(r): r.get("id") for r in selected_rows}
-
     ids = list(options.values())
+
     default_mother = st.session_state.parent_mother_id or (ids[0] if ids else None)
     default_father = st.session_state.parent_father_id or (ids[1] if len(ids) > 1 else None)
     if default_mother == default_father and len(ids) == 2:
@@ -351,8 +350,7 @@ else:
     st.session_state.parent_mother_id = chosen_mother_id
     st.session_state.parent_father_id = chosen_father_id
 
-    # Pretty summary
-    def row_by_id(fid: int) -> dict:
+    def row_by_id(fid: int) -> Dict:
         for r in selected_rows:
             if r.get("id") == fid:
                 return r
@@ -375,7 +373,7 @@ else:
         )
 
 # ------------------------------
-# Feature Summary (matches other page)
+# Feature Summary (from linked tables)
 # ------------------------------
 st.divider()
 st.subheader("🐟 Feature Summary (from linked tables)")
@@ -386,14 +384,11 @@ else:
     summary_rows = [build_feature_row(r) for r in selected_rows]
     summary_df = pd.DataFrame(summary_rows)
 
-    # Same fields as the other page:
     summary_cols = [
         "id", "name", "date_birth", "line_building_stage",
         "transgene_notes", "mutations", "treatments", "strains"
     ]
     summary_df = summary_df[[c for c in summary_cols if c in summary_df.columns]]
-
-    # Fill empty/NaN with None for consistency
     summary_df = summary_df.where(pd.notnull(summary_df), None)
 
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
@@ -401,9 +396,8 @@ else:
     csv = summary_df.to_csv(index=False).encode("utf-8")
     st.download_button("Download feature summary (CSV)", csv, "fish_feature_summary.csv", "text/csv")
 
-
 # ------------------------------
-# ➕ Quick Create: single-row entry table (correct dtypes + reliable linking)
+# ➕ Quick Create: single-row entry table
 # ------------------------------
 st.divider()
 st.subheader("➕ Create New Fish (quick entry)")
@@ -427,7 +421,6 @@ def _init_entry_df() -> pd.DataFrame:
 if "new_fish_entry_df" not in st.session_state:
     st.session_state.new_fish_entry_df = _init_entry_df()
 else:
-    # Keep dtype stable across reruns
     st.session_state.new_fish_entry_df["date_birth"] = pd.to_datetime(
         st.session_state.new_fish_entry_df["date_birth"], errors="coerce"
     )
@@ -488,12 +481,8 @@ if create_clicked:
         treatment_name = (row.get("treatment_name") or "").strip() or None
         treatment_notes = (row.get("treatment_notes") or "").strip() or None
 
-        # --- Create fish ---
-        fish_payload = {
-            "name": name,
-            "date_birth": date_birth_iso,
-            "notes": notes,
-        }
+        # --- Create fish (RLS enforced via anon client) ---
+        fish_payload = {"name": name, "date_birth": date_birth_iso, "notes": notes}
         if use_selected_parents:
             if st.session_state.parent_mother_id:
                 fish_payload["mother_fish_id"] = st.session_state.parent_mother_id
@@ -507,50 +496,29 @@ if create_clicked:
             raise RuntimeError("Fish was not created (no id returned).")
 
         # --- Lookups & Links (safe upserts) ---
-        # Mutation
         if mutation_name:
             mutation_id = get_or_create_by_name("mutations", "name", mutation_name)
             if mutation_id:
-                safe_link_upsert(
-                    "fish_mutations",
-                    {"fish_id": fish_id, "mutation_id": mutation_id},
-                    on_conflict="fish_id,mutation_id",
-                )
+                safe_link_upsert("fish_mutations", {"fish_id": fish_id, "mutation_id": mutation_id}, on_conflict="fish_id,mutation_id")
 
-        # Transgene
         if transgene_name:
             transgene_id = get_or_create_by_name("transgenes", "name", transgene_name)
             if transgene_id:
-                safe_link_upsert(
-                    "fish_transgenes",
-                    {"fish_id": fish_id, "transgene_id": transgene_id},
-                    on_conflict="fish_id,transgene_id",
-                )
+                safe_link_upsert("fish_transgenes", {"fish_id": fish_id, "transgene_id": transgene_id}, on_conflict="fish_id,transgene_id")
 
-        # Strain / background
         if strain_name:
             strain_id = get_or_create_by_name("strains", "name", strain_name)
             if strain_id:
-                safe_link_upsert(
-                    "fish_strains",
-                    {"fish_id": fish_id, "strain_id": strain_id},
-                    on_conflict="fish_id,strain_id",
-                )
+                safe_link_upsert("fish_strains", {"fish_id": fish_id, "strain_id": strain_id}, on_conflict="fish_id,strain_id")
 
-        # Treatment
         if treatment_type or treatment_name or treatment_notes:
             treatment_id = get_or_create_treatment(treatment_type, treatment_name, treatment_notes)
             if treatment_id:
-                safe_link_upsert(
-                    "fish_treatments",
-                    {"fish_id": fish_id, "treatment_id": treatment_id},
-                    on_conflict="fish_id,treatment_id",
-                )
+                safe_link_upsert("fish_treatments", {"fish_id": fish_id, "treatment_id": treatment_id}, on_conflict="fish_id,treatment_id")
 
         st.success(f"✅ Created fish '{name}' (id={fish_id}) and linked features.")
-        # Reset entry & refresh grid
         st.session_state.new_fish_entry_df = _init_entry_df()
-        fetch_fish.clear()  # invalidate cache
+        fetch_fish.clear()  # refresh cache
         try:
             st.rerun()
         except AttributeError:
@@ -558,3 +526,14 @@ if create_clicked:
 
     except Exception as e:
         st.error(f"Error creating fish: {e}")
+
+# ------------------------------
+# (Optional) Admin-only section (service role) — disabled by default
+# ------------------------------
+# If you truly need service-role actions on this page, uncomment below and set ADMIN_EMAILS env var.
+# from supabase_client import get_client
+# ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+# if user["email"].lower() in ADMIN_EMAILS:
+#     sb_admin = get_client()
+#     st.info("🛠 Admin mode enabled (service role). Use with caution: bypasses RLS.")
+#     # e.g., sb_admin.table("...").delete().eq(...).execute()
