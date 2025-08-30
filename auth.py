@@ -104,9 +104,10 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
 
     Order:
       1) Inject fragment-catcher (hash -> query params)
-      2) CONSUME query tokens (handle type=recovery here)
-      3) Try restore existing session
-      4) Show login UI (Magic link / Password / OAuth)
+      2) CONSUME query tokens (handle type=recovery here; flag magiclink)
+      3) If signed-in AND post-login prompt flag set -> show Set Password prompt
+      4) Try restore existing session
+      5) Show login UI (Magic link / Password / OAuth)
     """
     sb = get_supabase(anon=True)
 
@@ -121,7 +122,7 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
               var params = new URLSearchParams(h.substring(1));
               var at  = params.get("access_token");
               var rt  = params.get("refresh_token");
-              var typ = params.get("type"); // includes 'recovery' for reset links
+              var typ = params.get("type"); // 'magiclink' or 'recovery'
               if (at && rt) {
                 var url = new URL(window.location.href);
                 url.hash = "";
@@ -187,6 +188,10 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                                 st.error(f"Password update failed: {e}")
                     st.stop()  # stay on reset UI until done
 
+                # If this was a magic link, set a post-login prompt to nudge password setup once.
+                if typ == "magiclink":
+                    st.session_state["post_login_prompt"] = "set_password"
+
                 # Normal magic-link: store session and continue
                 st.session_state["sb_session"] = {"access_token": at, "refresh_token": rt}
                 st.query_params.clear()
@@ -196,12 +201,42 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
         except Exception as e:
             st.error(f"Token exchange failed: {e}")
 
-    # 3) No incoming tokens -> try restoring a saved session
+    # 3) If we already have a valid session AND a post-login prompt, show it now
+    def _maybe_prompt_set_password(sb_client: Client) -> None:
+        prompt = st.session_state.get("post_login_prompt")
+        if prompt == "set_password":
+            st.info("For easier sign-in next time, set a password now.")
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                p1 = st.text_input("New password", type="password", key="pw_post_1")
+                p2 = st.text_input("Confirm new password", type="password", key="pw_post_2")
+            with c2:
+                st.write("")  # spacing
+                if st.button("Set password", key="setpw_post"):
+                    if not p1 or p1 != p2:
+                        st.error("Passwords don't match.")
+                    else:
+                        try:
+                            sb_client.auth.update_user({"password": p1})
+                            st.success("Password set. You can now log in with email + password.")
+                            st.session_state.pop("post_login_prompt", None)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Password update failed: {e}")
+                if st.button("Skip", key="skip_setpw"):
+                    st.session_state.pop("post_login_prompt", None)
+                    st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.rerun()
+
+    # Try to restore session so we can show the prompt in-context
     user = _restore_session(sb)
     if user:
+        # If we need to prompt, do it now (inline) before returning.
+        if st.session_state.get("post_login_prompt"):
+            _maybe_prompt_set_password(sb)
+            st.stop()  # hold here until user sets/Skips; next run will return normally
         return sb, user
 
-    # 4) Login UI (magic link / password / oauth)
+    # 5) Login UI (magic link / password / oauth)
     st.info(
         "Sign in to continue. If you clicked a magic link and landed here, "
         "it should auto-complete. Otherwise send a new link or paste the URL below."
@@ -271,6 +306,8 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                                         except Exception as e:
                                             st.error(f"Password update failed: {e}")
                                 st.stop()
+                            # magiclink from pasted URL -> prompt on next run
+                            st.session_state["post_login_prompt"] = "set_password"
                             st.session_state["sb_session"] = {"access_token": pat, "refresh_token": prt}
                             st.success("Signed in!")
                             st.rerun()

@@ -77,3 +77,5 @@ if sb_admin:
         # Example: preview a table with service role (BE CAREFUL—bypasses RLS!)
         # preview = sb_admin.table("some_table").select("*").limit(5).execute().data
         # st.write(preview)
+
+https://appcarp-dg9lwwnuwbrb4yqiju3ted.streamlit.app/?auth_callback=1#access_token=eyJhbGciOiJIUzI1NiIsImtpZCI6InNXTDF5SldtejNIUHVuS2MiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3hkd3ptcWJyYmtobWhjandrb3ByLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJkNTFiNzNlMy0yYzU3LTQyN2MtOWY5Yi05YzRjMDY3ZjkyMWYiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzU2NTc0NzUxLCJpYXQiOjE3NTY1NzExNTEsImVtYWlsIjoiZGF2ZWtva2VsQGJlcmtlbGV5LmVkdSIsInBob25lIjoiIiwiYXBwX21ldGFkYXRhIjp7InByb3ZpZGVyIjoiZW1haWwiLCJwcm92aWRlcnMiOlsiZW1haWwiXX0sInVzZXJfbWV0YWRhdGEiOnsiZW1haWxfdmVyaWZpZWQiOnRydWV9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6Im90cCIsInRpbWVzdGFtcCI6MTc1NjU3MTE1MX1dLCJzZXNzaW9uX2lkIjoiMTk0NGNiYWQtMTkzZi00NjdkLWIzNWItOTM0ZGVkYTNlMDNjIiwiaXNfYW5vbnltb3VzIjpmYWxzZX0.9AfekcZE4Y-A93f33aSPRkK94YbedLzGEPK1QwQEL-4&expires_at=1756574751&expires_in=3600&refresh_token=5j6k3lzucepl&token_type=bearer&type=magiclink
