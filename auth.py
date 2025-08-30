@@ -2,71 +2,71 @@
 from __future__ import annotations
 
 from typing import Tuple, Dict, Any, Optional
-
 import os
+
 import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
 
+# =========================
+# Config & client helpers
+# =========================
 
-# ------------------------------
-# Config helpers
-# ------------------------------
 def resolve_redirect_url() -> str:
-    base = os.environ.get("PUBLIC_BASE_URL") or st.secrets.get("PUBLIC_BASE_URL")
-    if base:
-        return str(base).rstrip("/") + "/?auth_callback=1"
-    return "/?auth_callback=1"
+    """
+    Return the redirect target for Supabase magic links / OAuth.
+    We use a query-param callback because Streamlit doesn't serve custom paths.
+    """
+    base = os.environ.get("PUBLIC_BASE_URL") or st.secrets.get("PUBLIC_BASE_URL") or ""
+    base = str(base).rstrip("/")
+    return (base or "/") + "/?auth_callback=1"
 
 
-# ------------------------------
-# Supabase client (cached)
-# ------------------------------
 @st.cache_resource(show_spinner=False)
-def get_supabase(anon: bool = True) -> Client:
+def _make_client(url: str, key: str) -> Client:
     """
-    Returns a cached Supabase client.
-    - anon=True  -> use anon key (RLS enforced; NORMAL PAGES)
-    - anon=False -> use service role (bypasses RLS; ADMIN-ONLY PAGES)
+    Cache keyed by (url, key). Rotating keys yields a new client automatically.
     """
-    url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
-    if not url:
-        raise RuntimeError("Missing SUPABASE_URL in secrets or env.")
-
-    if anon:
-        key = os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
-        which = "SUPABASE_ANON_KEY"
-    else:
-        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-        which = "SUPABASE_SERVICE_ROLE_KEY"
-
-    if not key:
-        raise RuntimeError(f"Missing {which} in secrets or env.")
-
     return create_client(url, key)
 
 
-# ------------------------------
-# Session restore
-# ------------------------------
+def get_supabase(anon: bool = True) -> Client:
+    """
+    anon=True  -> anon key (RLS enforced; normal user actions)
+    anon=False -> service-role (BYPASSES RLS; admin-only)
+    """
+    url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
+    if not url:
+        raise RuntimeError("Missing SUPABASE_URL in secrets/env.")
+    if anon:
+        key = os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
+    else:
+        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not key:
+        which = "SUPABASE_ANON_KEY" if anon else "SUPABASE_SERVICE_ROLE_KEY"
+        raise RuntimeError(f"Missing {which} in secrets/env.")
+    return _make_client(url, key)
+
+
+# =========================
+# Session management
+# =========================
+
 def _restore_session(sb: Client) -> Optional[Dict[str, Any]]:
     """
-    Attempt to restore a saved auth session from st.session_state.
-    Returns the user dict if logged in, else None.
+    Restore user from saved tokens in session_state if possible.
     """
     sess = st.session_state.get("sb_session") or {}
-    at = sess.get("access_token")
-    rt = sess.get("refresh_token")
+    at, rt = sess.get("access_token"), sess.get("refresh_token")
     if not (at and rt):
         return None
-
     try:
         sb.auth.set_session(access_token=at, refresh_token=rt)
         u = sb.auth.get_user().user
         if u:
             return {"id": u.id, "email": getattr(u, "email", None)}
     except Exception:
-        # Try to refresh session if access token is stale
+        # Try refresh flow
         try:
             res = sb.auth.refresh_session()
             if res and res.session:
@@ -79,132 +79,171 @@ def _restore_session(sb: Client) -> Optional[Dict[str, Any]]:
                     return {"id": u.id, "email": getattr(u, "email", None)}
         except Exception:
             pass
-
-    # If we got here, stored tokens are invalid; clear them.
+    # Clear bad tokens
     for k in ("sb_session", "access_token", "refresh_token"):
         if k in st.session_state:
             del st.session_state[k]
     return None
 
 
-# ------------------------------
-# Sign out helper
-# ------------------------------
 def sign_out(sb: Client) -> None:
     """
-    Sign the current user out and clear any saved tokens.
+    Sign the user out and clear local tokens.
     """
     try:
         sb.auth.sign_out()
     except Exception:
         pass
-
     for k in ("sb_session", "access_token", "refresh_token"):
         if k in st.session_state:
             del st.session_state[k]
-
     try:
         st.query_params.clear()
     except Exception:
         pass
 
 
-# ------------------------------
-# Main UI gate
-# ------------------------------
-def auth_ui() -> Tuple[Client, Dict[str, Any]]:
+# =========================
+# Main gate UI
+# =========================
+
+def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
     """
-    Blocks with a small auth UI until the user is authenticated.
-    Returns (sb_client_with_anon_key, user_dict).
+    Block until authenticated. Returns (anon_client, {"id","email"}).
     """
     sb = get_supabase(anon=True)
 
-    # 1) Try restoring a saved session first
+    # 1) Try existing session
     user = _restore_session(sb)
     if user:
         return sb, user
 
-    # 2) CLIENT-SIDE FRAGMENT CATCHER:
-    # If the redirect brought a #access_token hash, grab it and turn into ?access_token=... query params
+    # 2) Client-side fragment catcher -> query params (works with Streamlit)
+    #    If link arrives like .../?auth_callback=1#access_token=...,
+    #    we convert it to .../?auth_callback=1&access_token=... then reload once.
     components.html(
-        """
+        f"""
         <script>
-        (function () {
-          var h = window.location.hash;
-          if (h && h.indexOf("access_token=") !== -1) {
-            var params = new URLSearchParams(h.substring(1));
-            var at = params.get("access_token");
-            var rt = params.get("refresh_token");
-            if (at && rt) {
-              var url = new URL(window.location.href);
-              url.hash = "";  // strip fragment
-              url.searchParams.set("access_token", at);
-              url.searchParams.set("refresh_token", rt);
-              window.location.replace(url.toString());
-            }
-          }
-        })();
+        (function () {{
+          try {{
+            var h = window.location.hash;
+            if (h && h.indexOf("access_token=") !== -1) {{
+              var params = new URLSearchParams(h.substring(1));
+              var at = params.get("access_token");
+              var rt = params.get("refresh_token");
+              if (at && rt) {{
+                var url = new URL(window.location.href);
+                url.hash = "";
+                if (!url.searchParams.get("access_token")) {{
+                  url.searchParams.set("access_token", at);
+                  url.searchParams.set("refresh_token", rt);
+                  window.location.replace(url.toString());
+                  return;
+                }}
+              }}
+            }}
+          }} catch (e) {{}}
+        }})();
         </script>
         """,
         height=0,
     )
 
-    # 3) SERVER-SIDE CONSUME TOKENS FROM QUERY PARAMS
+    # Optional tiny debug readout (turn on by passing debug=True)
+    if debug:
+        components.html(
+            """
+            <div style="font:12px/1.4 monospace;color:#666" id="authdbg"></div>
+            <script>
+              var d=document.getElementById('authdbg');
+              d.textContent = "href: " + window.location.href + "\\n" +
+                              "hash: " + window.location.hash;
+            </script>
+            """,
+            height=50,
+        )
+
+    # 3) Server-side: consume query tokens
     q = st.query_params
-    at = q.get("access_token")
-    rt = q.get("refresh_token")
+    at, rt = q.get("access_token"), q.get("refresh_token")
     if at and rt:
         try:
             sb.auth.set_session(access_token=at, refresh_token=rt)
             u = sb.auth.get_user().user
             if u:
-                # persist for future runs
                 st.session_state["sb_session"] = {"access_token": at, "refresh_token": rt}
-                # clear query params (tidy URL)
                 st.query_params.clear()
                 st.rerun()
+            else:
+                st.warning("Token present but no user returned (expired/used?).")
         except Exception as e:
-            st.warning(f"Token exchange failed: {e}")
+            st.error(f"Token exchange failed: {e}")
 
-    # ---- If we get here, still not logged in -> show login UI ----
-    st.info("👋 If you clicked a magic link, you should land here signed in. If not, try the Magic Link tab or enter the 6-digit code from the email.")
-
+    # 4) Login UI
+    st.info(
+        "Sign in to continue. If you clicked a magic link and landed here, "
+        "it should auto-complete. Otherwise send a new link or paste the URL below."
+    )
     tabs = st.tabs(["Magic Link", "Password", "OAuth"])
 
     # --- Magic Link ---
     with tabs[0]:
         st.subheader("Email Magic Link")
         ml_email = st.text_input("Email", key="ml_email")
-        col_ml1, col_ml2 = st.columns([1, 1])
-        with col_ml1:
+
+        c1, c2 = st.columns(2)
+        with c1:
             if st.button("Send magic link"):
                 try:
                     sb.auth.sign_in_with_otp({
                         "email": ml_email,
                         "options": {
                             "email_redirect_to": resolve_redirect_url(),
-                            "should_create_user": False,  # invite-only/team-only
+                            # If you run invite-only, set False and ensure the user exists first.
+                            "should_create_user": True,
                         },
                     })
-                    st.success("Magic link sent. Check your inbox.")
+                    st.success("Magic link sent. Open it in the SAME browser as this app.")
+                    st.caption("If it opens elsewhere (mail app webview), copy that URL and paste it on the right.")
                 except Exception as e:
                     st.error(f"Magic link failed: {e}")
-        # OTP fallback: Supabase emails often include a 6-digit code too
-        with col_ml2:
-            code = st.text_input("Enter 6-digit code from email (optional)", max_chars=6)
-            if st.button("Verify code"):
+
+        with c2:
+            st.caption("Paste the FULL magic-link URL if it opened in another app/browser:")
+            pasted = st.text_input(
+                "Paste URL (we'll extract access_token automatically)",
+                placeholder="https://...streamlit.app/?auth_callback=1#access_token=...&refresh_token=..."
+            )
+            if st.button("Use pasted link"):
+                from urllib.parse import urlparse, parse_qs
+                pat = prt = None
                 try:
-                    res = sb.auth.verify_otp({"email": ml_email, "token": code, "type": "email"})
-                    if res and res.session:
-                        st.session_state["sb_session"] = {
-                            "access_token": res.session.access_token,
-                            "refresh_token": res.session.refresh_token,
-                        }
-                        st.rerun()
+                    if pasted:
+                        u = urlparse(pasted)
+                        if u.fragment:
+                            frag = parse_qs(u.fragment)
+                            pat = (frag.get("access_token") or [None])[0]
+                            prt = (frag.get("refresh_token") or [None])[0]
+                        if not pat or not prt:
+                            qs = parse_qs(u.query or "")
+                            pat = pat or (qs.get("access_token") or [None])[0]
+                            prt = prt or (qs.get("refresh_token") or [None])[0]
+                    if pat and prt:
+                        sb.auth.set_session(access_token=pat, refresh_token=prt)
+                        u = sb.auth.get_user().user
+                        if u:
+                            st.session_state["sb_session"] = {
+                                "access_token": pat,
+                                "refresh_token": prt,
+                            }
+                            st.success("Signed in!")
+                            st.rerun()
+                        else:
+                            st.error("Tokens parsed but no user returned—likely expired/used.")
                     else:
-                        st.error("Verification failed. Double-check the code and email.")
+                        st.error("No access_token/refresh_token found in that URL.")
                 except Exception as e:
-                    st.error(f"Verify failed: {e}")
+                    st.error(f"Token import failed: {e}")
 
     # --- Password Sign-in ---
     with tabs[1]:
@@ -218,17 +257,16 @@ def auth_ui() -> Tuple[Client, Dict[str, Any]]:
                     "access_token": res.session.access_token,
                     "refresh_token": res.session.refresh_token,
                 }
-                    # rerun to show the app
                 st.rerun()
             except Exception as e:
                 st.error(f"Sign in failed: {e}")
 
         st.caption("Forgot password? Send a reset link below.")
-        forgot_email = st.text_input("Email for reset link", key="forgot_pw_email")
+        reset_email = st.text_input("Email for reset link", key="reset_email")
         if st.button("Send reset link"):
             try:
                 sb.auth.reset_password_email(
-                    forgot_email,
+                    reset_email,
                     options={"redirect_to": resolve_redirect_url()}
                 )
                 st.success("Password reset email sent.")
