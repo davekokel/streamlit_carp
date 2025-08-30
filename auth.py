@@ -15,10 +15,12 @@ from supabase import create_client, Client
 def resolve_redirect_url() -> str:
     """
     Redirect target for Supabase magic links / OAuth.
-    Streamlit doesn't support custom paths; we use a query-param sentinel.
+    Uses PUBLIC_BASE_URL when present (e.g., https://your-app.streamlit.app).
+    Falls back to root; app detects a special query flag.
     """
     base = os.environ.get("PUBLIC_BASE_URL") or st.secrets.get("PUBLIC_BASE_URL") or ""
     base = str(base).rstrip("/")
+    # Streamlit apps generally live at "/", and we key off ?auth_callback=1
     return (base or "/") + "/?auth_callback=1"
 
 
@@ -31,7 +33,7 @@ def _make_client(url: str, key: str) -> Client:
 def get_supabase(anon: bool = True) -> Client:
     """
     anon=True  -> anon key (RLS enforced; normal user actions)
-    anon=False -> service-role (BYPASSES RLS; admin-only)
+    anon=False -> service-role (BYPASSES RLS; admin-only server ops)
     """
     url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
     if not url:
@@ -60,25 +62,28 @@ def _restore_session(sb: Client) -> Optional[Dict[str, Any]]:
     if not (at and rt):
         return None
 
+    # First try: set provided tokens
     try:
         sb.auth.set_session(access_token=at, refresh_token=rt)
         u = sb.auth.get_user().user
         if u:
             return {"id": u.id, "email": getattr(u, "email", None)}
     except Exception:
-        # Try refresh flow if existing tokens are stale
-        try:
-            res = sb.auth.refresh_session()
-            if res and res.session:
-                st.session_state["sb_session"] = {
-                    "access_token": res.session.access_token,
-                    "refresh_token": res.session.refresh_token,
-                }
-                u = sb.auth.get_user().user
-                if u:
-                    return {"id": u.id, "email": getattr(u, "email", None)}
-        except Exception:
-            pass
+        pass
+
+    # Second try: refresh flow
+    try:
+        res = sb.auth.refresh_session()
+        if res and res.session:
+            st.session_state["sb_session"] = {
+                "access_token": res.session.access_token,
+                "refresh_token": res.session.refresh_token,
+            }
+            u = sb.auth.get_user().user
+            if u:
+                return {"id": u.id, "email": getattr(u, "email", None)}
+    except Exception:
+        pass
 
     # Clear bad tokens
     for k in ("sb_session", "access_token", "refresh_token"):
@@ -100,6 +105,19 @@ def sign_out(sb: Client) -> None:
         st.query_params.clear()
     except Exception:
         pass
+
+
+# =========================
+# Page guard (optional)
+# =========================
+
+def require_auth(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
+    """
+    Convenience wrapper for pages:
+        sb, user = require_auth()
+    If not authenticated, this will render the auth UI and stop.
+    """
+    return auth_ui(debug=debug)
 
 
 # =========================
@@ -238,7 +256,6 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
     # Try to restore session so we can show the prompt in-context
     user = _restore_session(sb)
     if user:
-        # If we need to prompt, do it now (inline) before returning.
         if st.session_state.get("post_login_prompt"):
             _maybe_prompt_set_password(sb)
             st.stop()  # hold here until user sets/Skips; next run will return normally
@@ -264,8 +281,7 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                         "email": ml_email,
                         "options": {
                             "email_redirect_to": resolve_redirect_url(),
-                            # set False for invite-only; True simplifies testing
-                            "should_create_user": True,
+                            "should_create_user": True,  # True simplifies testing; set False for invite-only
                         },
                     })
                     st.success("Magic link sent. Open it in the SAME browser as this app.")
@@ -277,7 +293,7 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
             st.caption("Paste the FULL magic-link URL if it opened in another app/browser:")
             pasted = st.text_input(
                 "Paste URL (we'll extract access_token automatically)",
-                placeholder="https://...streamlit.app/?auth_callback=1#access_token=...&refresh_token=...&type=recovery"
+                placeholder="https://…/ ?auth_callback=1#access_token=…&refresh_token=…&type=recovery"
             )
             if st.button("Use pasted link"):
                 from urllib.parse import urlparse, parse_qs
@@ -285,6 +301,7 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                 try:
                     if pasted:
                         u = urlparse(pasted)
+                        # Prefer fragment (hash), then fall back to querystring
                         if u.fragment:
                             frag = parse_qs(u.fragment)
                             pat  = (frag.get("access_token") or [None])[0]

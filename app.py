@@ -3,7 +3,7 @@ import os
 import streamlit as st
 
 # Auth helpers (make sure auth.py is in the same folder)
-from auth import auth_ui, sign_out, get_supabase
+from auth import auth_ui, sign_out
 
 # Your existing helper that returns a service-role client (admin-only!)
 from supabase_client import get_client
@@ -33,15 +33,15 @@ with st.sidebar:
 # ------------------------------
 # Optional: Admin connection (service role) for allowlisted emails
 # ------------------------------
-# Set ADMIN_EMAILS env var as a comma-separated list, or edit below.
+# Set ADMIN_EMAILS env var as a comma-separated list (e.g., "you@company.com,admin@org.org")
 ADMIN_EMAILS = {
     e.strip().lower()
-    for e in os.environ.get("ADMIN_EMAILS", "you@company.com").split(",")
+    for e in os.environ.get("ADMIN_EMAILS", "").split(",")
     if e.strip()
 }
 
 sb_admin = None
-if user["email"].lower() in ADMIN_EMAILS:
+if user.get("email", "").lower() in ADMIN_EMAILS:
     try:
         sb_admin = get_client()  # your existing service-role client
         st.sidebar.success("Admin (service role) connected ✔")
@@ -55,11 +55,18 @@ else:
 # ------------------------------
 # Lightweight check using the user-scoped anon client.
 # Replace 'profiles' with any table that the signed-in user can read.
+ok = False
 try:
     sb.table("profiles").select("id").limit(1).execute()
-    st.success("Connected to Supabase ✔ (user session)")
+    ok = True
 except Exception as e:
-    st.error(f"User session connection issue: {e}")
+    # If 'profiles' doesn't exist or is blocked by RLS, show a gentle message.
+    st.info("Tried probing the 'profiles' table to verify connectivity.")
+    st.caption("If your schema doesn't have 'profiles', change the table name below.")
+    st.exception(e)
+
+if ok:
+    st.success("Connected to Supabase ✔ (user session)")
 
 st.markdown(
     """
@@ -70,12 +77,10 @@ st.markdown(
     """
 )
 
-# If you still want to show a separate “admin connection ok” check using your original get_client():
+# Optional: separate “admin connection ok” check using your original get_client()
 if sb_admin:
     with st.expander("🛠️ Admin tools (service role)"):
         st.write("You have access to admin-only features.")
-        # Example: preview a table with service role (BE CAREFUL—bypasses RLS!)
+        # Example (disabled by default): preview with service role. BE CAREFUL—bypasses RLS!
         # preview = sb_admin.table("some_table").select("*").limit(5).execute().data
         # st.write(preview)
-
-https://appcarp-dg9lwwnuwbrb4yqiju3ted.streamlit.app/?auth_callback=1#access_token=eyJhbGciOiJIUzI1NiIsImtpZCI6InNXTDF5SldtejNIUHVuS2MiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3hkd3ptcWJyYmtobWhjandrb3ByLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJkNTFiNzNlMy0yYzU3LTQyN2MtOWY5Yi05YzRjMDY3ZjkyMWYiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzU2NTc0NzUxLCJpYXQiOjE3NTY1NzExNTEsImVtYWlsIjoiZGF2ZWtva2VsQGJlcmtlbGV5LmVkdSIsInBob25lIjoiIiwiYXBwX21ldGFkYXRhIjp7InByb3ZpZGVyIjoiZW1haWwiLCJwcm92aWRlcnMiOlsiZW1haWwiXX0sInVzZXJfbWV0YWRhdGEiOnsiZW1haWxfdmVyaWZpZWQiOnRydWV9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6Im90cCIsInRpbWVzdGFtcCI6MTc1NjU3MTE1MX1dLCJzZXNzaW9uX2lkIjoiMTk0NGNiYWQtMTkzZi00NjdkLWIzNWItOTM0ZGVkYTNlMDNjIiwiaXNfYW5vbnltb3VzIjpmYWxzZX0.9AfekcZE4Y-A93f33aSPRkK94YbedLzGEPK1QwQEL-4&expires_at=1756574751&expires_in=3600&refresh_token=5j6k3lzucepl&token_type=bearer&type=magiclink
