@@ -1,15 +1,126 @@
-# auth.py (only the auth_ui function shown; keep the rest of your file as-is)
+# auth.py
 from __future__ import annotations
 
-import os
-from typing import Optional, Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 
+import os
 import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
 
-# ... keep your resolve_redirect_url(), get_supabase(), _restore_session(), sign_out() ...
 
+# ------------------------------
+# Config helpers
+# ------------------------------
+def resolve_redirect_url() -> str:
+    """
+    Where Supabase should redirect back after magic link / OAuth / reset.
+    Prefer PUBLIC_BASE_URL in secrets/env; otherwise fall back to current page.
+    """
+    # Prefer explicit base URL (recommended on Streamlit Cloud)
+    base = os.environ.get("PUBLIC_BASE_URL") or st.secrets.get("PUBLIC_BASE_URL")
+    if base:
+        return str(base).rstrip("/")
+
+    # Fallback: use current app URL without query/fragment (works locally)
+    # NOTE: In Streamlit, server-side code can’t directly read window.location.
+    # For safety, default to the root path; fragment catcher handles tokens.
+    return "/"
+
+
+# ------------------------------
+# Supabase client (cached)
+# ------------------------------
+@st.cache_resource(show_spinner=False)
+def get_supabase(anon: bool = True) -> Client:
+    """
+    Returns a cached Supabase client.
+    - anon=True  -> use anon key (RLS enforced; NORMAL PAGES)
+    - anon=False -> use service role (bypasses RLS; ADMIN-ONLY PAGES)
+    """
+    url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
+    if not url:
+        raise RuntimeError("Missing SUPABASE_URL in secrets or env.")
+
+    if anon:
+        key = os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
+        which = "SUPABASE_ANON_KEY"
+    else:
+        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+        which = "SUPABASE_SERVICE_ROLE_KEY"
+
+    if not key:
+        raise RuntimeError(f"Missing {which} in secrets or env.")
+
+    return create_client(url, key)
+
+
+# ------------------------------
+# Session restore
+# ------------------------------
+def _restore_session(sb: Client) -> Optional[Dict[str, Any]]:
+    """
+    Attempt to restore a saved auth session from st.session_state.
+    Returns the user dict if logged in, else None.
+    """
+    sess = st.session_state.get("sb_session") or {}
+    at = sess.get("access_token")
+    rt = sess.get("refresh_token")
+    if not (at and rt):
+        return None
+
+    try:
+        sb.auth.set_session(access_token=at, refresh_token=rt)
+        u = sb.auth.get_user().user
+        if u:
+            return {"id": u.id, "email": getattr(u, "email", None)}
+    except Exception:
+        # Try to refresh session if access token is stale
+        try:
+            res = sb.auth.refresh_session()
+            if res and res.session:
+                st.session_state["sb_session"] = {
+                    "access_token": res.session.access_token,
+                    "refresh_token": res.session.refresh_token,
+                }
+                u = sb.auth.get_user().user
+                if u:
+                    return {"id": u.id, "email": getattr(u, "email", None)}
+        except Exception:
+            pass
+
+    # If we got here, stored tokens are invalid; clear them.
+    for k in ("sb_session", "access_token", "refresh_token"):
+        if k in st.session_state:
+            del st.session_state[k]
+    return None
+
+
+# ------------------------------
+# Sign out helper
+# ------------------------------
+def sign_out(sb: Client) -> None:
+    """
+    Sign the current user out and clear any saved tokens.
+    """
+    try:
+        sb.auth.sign_out()
+    except Exception:
+        pass
+
+    for k in ("sb_session", "access_token", "refresh_token"):
+        if k in st.session_state:
+            del st.session_state[k]
+
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+
+# ------------------------------
+# Main UI gate
+# ------------------------------
 def auth_ui() -> Tuple[Client, Dict[str, Any]]:
     """
     Blocks with a small auth UI until the user is authenticated.
@@ -73,7 +184,7 @@ def auth_ui() -> Tuple[Client, Dict[str, Any]]:
     with tabs[0]:
         st.subheader("Email Magic Link")
         ml_email = st.text_input("Email", key="ml_email")
-        col_ml1, col_ml2 = st.columns([1,1])
+        col_ml1, col_ml2 = st.columns([1, 1])
         with col_ml1:
             if st.button("Send magic link"):
                 try:
@@ -81,7 +192,7 @@ def auth_ui() -> Tuple[Client, Dict[str, Any]]:
                         "email": ml_email,
                         "options": {
                             "email_redirect_to": resolve_redirect_url(),
-                            "should_create_user": False,  # invite-only
+                            "should_create_user": False,  # invite-only/team-only
                         },
                     })
                     st.success("Magic link sent. Check your inbox.")
@@ -116,6 +227,7 @@ def auth_ui() -> Tuple[Client, Dict[str, Any]]:
                     "access_token": res.session.access_token,
                     "refresh_token": res.session.refresh_token,
                 }
+                    # rerun to show the app
                 st.rerun()
             except Exception as e:
                 st.error(f"Sign in failed: {e}")
