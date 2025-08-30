@@ -13,19 +13,11 @@ from supabase import create_client, Client
 # Config helpers
 # ------------------------------
 def resolve_redirect_url() -> str:
-    """
-    Where Supabase should redirect back after magic link / OAuth / reset.
-    Prefer PUBLIC_BASE_URL in secrets/env; otherwise fall back to current page.
-    """
-    # Prefer explicit base URL (recommended on Streamlit Cloud)
     base = os.environ.get("PUBLIC_BASE_URL") or st.secrets.get("PUBLIC_BASE_URL")
     if base:
-        return str(base).rstrip("/")
-
-    # Fallback: use current app URL without query/fragment (works locally)
-    # NOTE: In Streamlit, server-side code can’t directly read window.location.
-    # For safety, default to the root path; fragment catcher handles tokens.
-    return "/"
+        return str(base).rstrip("/") + "/auth-callback"
+    # fallback for local (works with localhost when you paste it into secrets/env)
+    return "/auth-callback"
 
 
 # ------------------------------
