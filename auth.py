@@ -7,55 +7,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
 
-def _password_reset_form(form_key: str, submit_label: str = "Set password") -> Optional[tuple[str, str]]:
-    """
-    Renders a stable form for setting a new password, with Safari-friendly attributes.
-    Returns (pw1, pw2) if submitted, else None.
-    """
-    import streamlit as st
-    import streamlit.components.v1 as components
-
-    # Container so we can scope the JS to just this section
-    container = st.container()
-
-    with container:
-        with st.form(form_key, clear_on_submit=False, border=True):
-            # Avoid the literal word "password" in labels to reduce autofill heuristics
-            pw1 = st.text_input("New passphrase", type="password", key=form_key + "_pw1", placeholder="Enter new passphrase")
-            pw2 = st.text_input("Confirm passphrase", type="password", key=form_key + "_pw2", placeholder="Re-enter new passphrase")
-            submitted = st.form_submit_button(submit_label)
-
-    # Inject a tiny script that marks these as "new-password" fields for Safari
-    # We scope it to the last rendered container using a unique data-attr.
-    components.html(
-        f"""
-        <script>
-        (function() {{
-          try {{
-            // Find the last Streamlit form we rendered (by key suffix)
-            const forms = Array.from(parent.document.querySelectorAll('form'));
-            const target = forms.filter(f => f.innerText.includes('{submit_label}')).slice(-1)[0];
-            if (target) {{
-              const inputs = target.querySelectorAll('input[type="password"]');
-              inputs.forEach((inp, idx) => {{
-                inp.setAttribute('autocomplete', 'new-password');
-                inp.setAttribute('autocorrect', 'off');
-                inp.setAttribute('autocapitalize', 'none');
-                inp.setAttribute('spellcheck', 'false');
-                // Distinct names help password managers avoid pairing them with "current password"
-                inp.setAttribute('name', idx === 0 ? 'new-password' : 'new-password-confirm');
-              }});
-            }}
-          }} catch (e) {{}}
-        }})();
-        </script>
-        """,
-        height=0,
-    )
-
-    if 'submitted' in locals() and submitted:
-        return pw1, pw2
-    return None
 
 # =========================
 # Config & client helpers
@@ -157,6 +108,55 @@ def sign_out(sb: Client) -> None:
 
 
 # =========================
+# Safari-safe password form
+# =========================
+
+def _password_reset_form(form_key: str, submit_label: str = "Set password") -> Optional[tuple[str, str]]:
+    """
+    Renders a stable form for setting a new password, with Safari-friendly attributes.
+    Returns (pw1, pw2) if submitted, else None.
+    """
+    import streamlit.components.v1 as components
+
+    container = st.container()
+    with container:
+        with st.form(form_key, clear_on_submit=False, border=True):
+            # Avoid the literal word "password" in labels to reduce autofill heuristics
+            pw1 = st.text_input("New passphrase", type="password", key=form_key + "_pw1", placeholder="Enter new passphrase")
+            pw2 = st.text_input("Confirm passphrase", type="password", key=form_key + "_pw2", placeholder="Re-enter new passphrase")
+            submitted = st.form_submit_button(submit_label)
+
+    # Mark inputs as "new-password" so Safari doesn't interrupt
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          try {{
+            const forms = Array.from(parent.document.querySelectorAll('form'));
+            const target = forms.filter(f => f.innerText.includes('{submit_label}')).slice(-1)[0];
+            if (target) {{
+              const inputs = target.querySelectorAll('input[type="password"]');
+              inputs.forEach((inp, idx) => {{
+                inp.setAttribute('autocomplete', 'new-password');
+                inp.setAttribute('autocorrect', 'off');
+                inp.setAttribute('autocapitalize', 'none');
+                inp.setAttribute('spellcheck', 'false');
+                inp.setAttribute('name', idx === 0 ? 'new-password' : 'new-password-confirm');
+              }});
+            }}
+          }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+    if 'submitted' in locals() and submitted:
+        return pw1, pw2
+    return None
+
+
+# =========================
 # Page guard (optional)
 # =========================
 
@@ -182,7 +182,7 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
       2) CONSUME query tokens (handle type=recovery here; flag magiclink)
       3) If signed-in AND post-login prompt flag set -> show Set Password prompt
       4) Try restore existing session
-      5) Show login UI (Magic link / Password / OAuth)
+      5) Show login UI (Magic Link / Password / OAuth)
     """
     sb = get_supabase(anon=True)
 
@@ -246,7 +246,6 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
             u = sb.auth.get_user().user
             if u:
                 if typ == "recovery":
-                    # Show the set-password form immediately
                     st.success("You're authenticated to reset your password.")
                     vals = _password_reset_form("reset_pw_recovery", submit_label="Set password")
                     if vals:
@@ -424,11 +423,11 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                             if u:
                                 if ptyp == "recovery":
                                     st.success("You're authenticated to reset your password.")
-                                    n1 = st.text_input("New password", type="password", key="newpw1")
-                                    n2 = st.text_input("Confirm new password", type="password", key="newpw2")
-                                    if st.button("Set password", key="setpw_paste"):
+                                    vals = _password_reset_form("reset_pw_from_paste", submit_label="Set password")
+                                    if vals:
+                                        n1, n2 = vals
                                         if not n1 or n1 != n2:
-                                            st.error("Passwords don't match.")
+                                            st.error("Passphrases don't match.")
                                         else:
                                             try:
                                                 sb.auth.update_user({"password": n1})
@@ -498,9 +497,10 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                     reset_email,
                     options={"redirect_to": resolve_redirect_url()}
                 )
-                st.success("Password reset email sent. Click it and set a new password.")
             except Exception as e:
                 st.error(f"Reset failed: {e}")
+            else:
+                st.success("Password reset email sent. Click it and set a new password.")
 
     # --- OAuth (optional) ---
     with tabs[2]:
