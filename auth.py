@@ -7,6 +7,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
 
+
 # =========================
 # Config & client helpers
 # =========================
@@ -14,7 +15,7 @@ from supabase import create_client, Client
 def resolve_redirect_url() -> str:
     """
     Redirect target for Supabase magic links / OAuth.
-    Use a query-param callback because Streamlit doesn't serve custom paths.
+    Streamlit doesn't support custom paths; we use a query-param sentinel.
     """
     base = os.environ.get("PUBLIC_BASE_URL") or st.secrets.get("PUBLIC_BASE_URL") or ""
     base = str(base).rstrip("/")
@@ -35,6 +36,7 @@ def get_supabase(anon: bool = True) -> Client:
     url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
     if not url:
         raise RuntimeError("Missing SUPABASE_URL in secrets/env.")
+
     key = (
         os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
         if anon else
@@ -43,7 +45,9 @@ def get_supabase(anon: bool = True) -> Client:
     if not key:
         which = "SUPABASE_ANON_KEY" if anon else "SUPABASE_SERVICE_ROLE_KEY"
         raise RuntimeError(f"Missing {which} in secrets/env.")
+
     return _make_client(url, key)
+
 
 # =========================
 # Session management
@@ -55,12 +59,14 @@ def _restore_session(sb: Client) -> Optional[Dict[str, Any]]:
     at, rt = sess.get("access_token"), sess.get("refresh_token")
     if not (at and rt):
         return None
+
     try:
         sb.auth.set_session(access_token=at, refresh_token=rt)
         u = sb.auth.get_user().user
         if u:
             return {"id": u.id, "email": getattr(u, "email", None)}
     except Exception:
+        # Try refresh flow if existing tokens are stale
         try:
             res = sb.auth.refresh_session()
             if res and res.session:
@@ -73,6 +79,7 @@ def _restore_session(sb: Client) -> Optional[Dict[str, Any]]:
                     return {"id": u.id, "email": getattr(u, "email", None)}
         except Exception:
             pass
+
     # Clear bad tokens
     for k in ("sb_session", "access_token", "refresh_token"):
         if k in st.session_state:
@@ -93,6 +100,7 @@ def sign_out(sb: Client) -> None:
         st.query_params.clear()
     except Exception:
         pass
+
 
 # =========================
 # Main gate UI
@@ -161,7 +169,7 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
 
     if at and rt:
         try:
-            # If handling a recovery link, ignore any existing session so reset UI shows reliably
+            # For recovery links, ignore any existing session so reset UI shows reliably
             if typ == "recovery":
                 for k in ("sb_session", "access_token", "refresh_token"):
                     if k in st.session_state:
@@ -192,7 +200,7 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                 if typ == "magiclink":
                     st.session_state["post_login_prompt"] = "set_password"
 
-                # Normal magic-link: store session and continue
+                # Normal magic-link path: store session and continue
                 st.session_state["sb_session"] = {"access_token": at, "refresh_token": rt}
                 st.query_params.clear()
                 st.rerun()
@@ -225,7 +233,7 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                             st.error(f"Password update failed: {e}")
                 if st.button("Skip", key="skip_setpw"):
                     st.session_state.pop("post_login_prompt", None)
-                    st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.rerun()
+                    st.rerun()
 
     # Try to restore session so we can show the prompt in-context
     user = _restore_session(sb)
