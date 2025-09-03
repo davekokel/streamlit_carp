@@ -7,6 +7,7 @@
 # ------------------------------------------------------------
 from __future__ import annotations
 
+import math
 import pandas as pd
 import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
@@ -64,10 +65,34 @@ def _uniq_preserve(seq):
 
 def global_filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
     """Case-insensitive literal substring match across ALL columns."""
-    if not (query or "").strip():
+    q = (query or "").strip()
+    if not q:
         return df
-    mask = df.astype(str).apply(lambda s: s.str.contains(query, case=False, na=False, regex=False))
+    mask = df.astype(str).apply(lambda s: s.str.contains(q, case=False, na=False, regex=False))
     return df[mask.any(axis=1)]
+
+def _split_terms(value: str) -> list[str]:
+    """Split a text input on commas/whitespace into non-empty terms."""
+    if not value:
+        return []
+    parts = [p.strip() for chunk in value.split(",") for p in chunk.split()]
+    return [p for p in parts if p]
+
+def _contains_any_ci(series: pd.Series, terms: list[str]) -> pd.Series:
+    """Case-insensitive 'contains ANY of the terms' for a string series."""
+    if not terms:
+        return pd.Series(True, index=series.index)
+    s = series.fillna("").astype(str).str.lower()
+    mask = pd.Series(False, index=series.index)
+    for t in terms:
+        mask = mask | s.str.contains(t.lower(), na=False)
+    return mask
+
+def _combine_masks(mask_a: pd.Series, mask_b: pd.Series, op: str) -> pd.Series:
+    op = (op or "AND").upper()
+    if op == "OR":
+        return mask_a | mask_b
+    return mask_a & mask_b  # default AND
 
 # ---- Linked fetchers ----
 @st.cache_data(ttl=60)
@@ -127,7 +152,6 @@ def linked_strains(fish_id: int) -> list[dict]:
 
 # ---- Formatters ----
 def fmt_transgene_notes(rows: list[dict]) -> str:
-    """Return 'TransgeneName: note' for each linked transgene with notes."""
     parts = []
     for r in rows:
         name = (r.get("name") or "").strip()
@@ -190,33 +214,110 @@ if "created_at" in df.columns:
 
 # Sidebar filters
 st.sidebar.header("🔎 Filters")
-global_q = st.sidebar.text_input("Global search (all columns)", placeholder="e.g. 'cmv', 'amp', '2025-08-29'")
-name_filter = st.sidebar.text_input("Name contains")
-stage_filter = st.sidebar.text_input("Line building stage contains")
 
+# Global search (case-insensitive)
+global_q = st.sidebar.text_input("Global search (all columns, case-insensitive)",
+                                 placeholder="e.g. cmv, amp, 2025-08-29")
+
+# Field-specific searches (comma-separated terms allowed)
+name_filter  = st.sidebar.text_input("Name contains (comma-separated terms)")
+stage_filter = st.sidebar.text_input("Line building stage contains (comma-separated terms)")
+notes_filter = st.sidebar.text_input("Notes contains (comma-separated terms)")  # <-- NEW
+
+# How to combine the field filters together
+combine_logic = st.sidebar.radio("Combine Name + Stage + Notes with", options=["AND", "OR"], horizontal=True)
+
+# Grid page size (affects page count)
+page_size = st.sidebar.number_input("Rows per page", min_value=10, max_value=200, value=25, step=5)
+
+# ---- Apply filters ----
 filtered = df.copy()
+
+# 1) Global filter (case-insensitive across all columns)
 filtered = global_filter_df(filtered, global_q)
 
-if name_filter and "name" in filtered.columns:
-    filtered = filtered[filtered["name"].str.contains(name_filter, case=False, na=False)]
-if stage_filter and "line_building_stage" in filtered.columns:
-    filtered = filtered[filtered["line_building_stage"].str.contains(stage_filter, case=False, na=False)]
+# 2) Field filters with AND/OR combination, each accepts multiple terms
+name_terms  = _split_terms(name_filter)
+stage_terms = _split_terms(stage_filter)
+notes_terms = _split_terms(notes_filter)
 
-st.subheader(f"Showing {len(filtered)} of {len(df)} fish")
+mask_name  = pd.Series(True, index=filtered.index)
+mask_stage = pd.Series(True, index=filtered.index)
+mask_notes = pd.Series(True, index=filtered.index)
 
-# Grid
-filtered = filtered.reset_index(drop=True)
-front = [c for c in ["id", "name", "date_birth", "line_building_stage", "created_at"] if c in filtered.columns]
-rest = [c for c in filtered.columns if c not in front]
-filtered = filtered[front + rest]
+if "name" in filtered.columns and name_terms:
+    mask_name = _contains_any_ci(filtered["name"], name_terms)
 
-gob = GridOptionsBuilder.from_dataframe(filtered)
+if "line_building_stage" in filtered.columns and stage_terms:
+    mask_stage = _contains_any_ci(filtered["line_building_stage"], stage_terms)
+
+if "notes" in filtered.columns and notes_terms:
+    mask_notes = _contains_any_ci(filtered["notes"], notes_terms)
+
+# Combine all three masks using the chosen logic
+combined_mask = _combine_masks(mask_name, mask_stage, combine_logic)
+combined_mask = _combine_masks(combined_mask, mask_notes, combine_logic)
+filtered = filtered[combined_mask]
+
+# Status / counts
+total_rows = len(df)
+shown_rows = len(filtered)
+total_pages = max(1, math.ceil(shown_rows / int(page_size)))
+
+# ------------------------------
+# Upper pagination controls (Prev | Page # | Next)
+# ------------------------------
+if "fish_page" not in st.session_state:
+    st.session_state.fish_page = 1
+
+# If filters/page_size change, clamp/reset page
+if st.session_state.fish_page > total_pages:
+    st.session_state.fish_page = total_pages
+if st.session_state.fish_page < 1:
+    st.session_state.fish_page = 1
+
+top_l, top_c, top_r = st.columns([1, 2, 1])
+with top_l:
+    if st.button("◀ Prev", use_container_width=True, disabled=(st.session_state.fish_page <= 1)):
+        st.session_state.fish_page -= 1
+        st.rerun()
+with top_c:
+    new_page = st.number_input(
+        "Page",
+        min_value=1,
+        max_value=total_pages,
+        value=st.session_state.fish_page,
+        step=1,
+        key="page_number_input",
+        help="Jump to a specific page of fish.",
+    )
+    if new_page != st.session_state.fish_page:
+        st.session_state.fish_page = int(new_page)
+        st.rerun()
+with top_r:
+    if st.button("Next ▶", use_container_width=True, disabled=(st.session_state.fish_page >= total_pages)):
+        st.session_state.fish_page += 1
+        st.rerun()
+
+st.caption(f"Showing {shown_rows} of {total_rows} fish • Page size: {int(page_size)} • Page {st.session_state.fish_page} of {total_pages}")
+
+# Slice current page
+start = (st.session_state.fish_page - 1) * int(page_size)
+end = start + int(page_size)
+page_df = filtered.iloc[start:end].reset_index(drop=True)
+
+# Grid: bring common cols to the front
+front = [c for c in ["id", "name", "date_birth", "line_building_stage", "created_at"] if c in page_df.columns]
+rest = [c for c in page_df.columns if c not in front]
+page_df = page_df[front + rest]
+
+gob = GridOptionsBuilder.from_dataframe(page_df)
 gob.configure_default_column(resizable=True, sortable=True, filter=True)
 gob.configure_selection(selection_mode="multiple", use_checkbox=True)
-gob.configure_grid_options(rowSelection="multiple", domLayout="normal", pagination=True, paginationPageSize=25)
+gob.configure_grid_options(domLayout="normal", pagination=False)
 
 grid = AgGrid(
-    filtered,
+    page_df,
     gridOptions=gob.build(),
     update_mode=GridUpdateMode.SELECTION_CHANGED,
     allow_unsafe_jscode=False,
