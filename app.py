@@ -17,8 +17,34 @@ st.title("🗃️ Supabase Visualizer")
 # ------------------------------
 # Require sign-in
 # ------------------------------
-# sb = anon-key client (RLS enforced), user = {"id", "email"}
-sb, user = auth_ui()  # blocks with login UI until authenticated
+# Hint the auth UI to show Password first (if supported), else gracefully fall back.
+# We also set a query param that some auth_ui implementations read.
+qp = st.query_params
+if qp.get("auth") != "password":
+    qp["auth"] = "password"
+    st.query_params = qp  # updates the URL; harmless if unsupported
+
+sb = None
+user = None
+_auth_ex = None
+
+try:
+    # Most likely signature if your auth_ui supports a preferred tab
+    sb, user = auth_ui(prefer_password_first=True)
+except TypeError as e:
+    _auth_ex = e
+    try:
+        # Alternate common kw name
+        sb, user = auth_ui(default_tab="password")
+    except TypeError as e2:
+        _auth_ex = e2
+        # Final fallback: original call (Magic link might show first)
+        sb, user = auth_ui()
+        st.info(
+            "Password-first hint not supported by your current auth_ui. "
+            "If you want the Password tab to appear first permanently, "
+            "add a parameter like prefer_password_first=True or default_tab='password' in auth.py."
+        )
 
 # ------------------------------
 # Sidebar: session info & sign-out
@@ -53,14 +79,11 @@ else:
 # ------------------------------
 # App content (keeps your original UX)
 # ------------------------------
-# Lightweight check using the user-scoped anon client.
-# Replace 'profiles' with any table that the signed-in user can read.
 ok = False
 try:
     sb.table("profiles").select("id").limit(1).execute()
     ok = True
 except Exception as e:
-    # If 'profiles' doesn't exist or is blocked by RLS, show a gentle message.
     st.info("Tried probing the 'profiles' table to verify connectivity.")
     st.caption("If your schema doesn't have 'profiles', change the table name below.")
     st.exception(e)

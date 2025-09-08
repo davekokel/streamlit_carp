@@ -173,7 +173,46 @@ def require_auth(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
 # Main gate UI
 # =========================
 
-def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
+def _resolve_default_tab(prefer_password_first: bool, default_tab: Optional[str]) -> str:
+    """
+    Decide which tab should appear first.
+    Priority:
+      1) explicit default_tab param
+      2) URL query param ?auth=...
+      3) prefer_password_first flag
+      4) fallback to 'password'
+    Returns one of: 'password', 'magic', 'oauth'
+    """
+    # Normalize helper
+    def norm(x: Optional[str]) -> Optional[str]:
+        if not x:
+            return None
+        x = x.strip().lower()
+        if x in ("password", "pass", "pw"):
+            return "password"
+        if x in ("magic", "magiclink", "link"):
+            return "magic"
+        if x in ("oauth", "social", "sso"):
+            return "oauth"
+        return None
+
+    qp_choice = norm(st.query_params.get("auth"))
+    param_choice = norm(default_tab)
+    if param_choice:
+        return param_choice
+    if qp_choice:
+        return qp_choice
+    if prefer_password_first:
+        return "password"
+    return "password"  # default
+
+
+def auth_ui(
+    debug: bool = False,
+    *,
+    prefer_password_first: bool = False,
+    default_tab: Optional[str] = None,
+) -> Tuple[Client, Dict[str, Any]]:
     """
     Block until authenticated. Returns (anon_client, {"id","email"}).
 
@@ -182,7 +221,11 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
       2) CONSUME query tokens (handle type=recovery here; flag magiclink)
       3) If signed-in AND post-login prompt flag set -> show Set Password prompt
       4) Try restore existing session
-      5) Show login UI (Magic Link / Password / OAuth)
+      5) Show login UI (tabs: Password / Magic Link / OAuth) with chosen default first
+
+    Parameters:
+      prefer_password_first: bool      → if True, Password tab is shown first
+      default_tab: {'password'|'magic'|'oauth'} → explicit first tab choice
     """
     sb = get_supabase(anon=True)
 
@@ -305,15 +348,56 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
             st.stop()  # hold here until user sets/Skips; next run will return normally
         return sb, user
 
-    # 5) Login UI (magic link / password / oauth)
+    # 5) Login UI (Password / Magic Link / OAuth) with chosen default first
+    choice = _resolve_default_tab(prefer_password_first, default_tab)
+
+    base_order = ["Password", "Magic Link", "OAuth"]
+    if choice == "magic":
+        tab_order = ["Magic Link", "Password", "OAuth"]
+    elif choice == "oauth":
+        tab_order = ["OAuth", "Password", "Magic Link"]
+    else:
+        tab_order = ["Password", "Magic Link", "OAuth"]
+
+    tabs = st.tabs(tab_order)
+    tab_index = {name: i for i, name in enumerate(tab_order)}
+
     st.info(
         "Sign in to continue. If you clicked a magic link and landed here, "
         "it should auto-complete. Otherwise send a new link or paste the URL below."
     )
-    tabs = st.tabs(["Magic Link", "Password", "OAuth"])
+
+    # --- Password Sign-in (always implemented; now typically first) ---
+    with tabs[tab_index["Password"]]:
+        st.subheader("Password Sign-In")
+        email = st.text_input("Email", key="signin_email")
+        password = st.text_input("Password", type="password", key="signin_pw")
+        if st.button("Sign in"):
+            try:
+                res = sb.auth.sign_in_with_password({"email": email, "password": password})
+                st.session_state["sb_session"] = {
+                    "access_token": res.session.access_token,
+                    "refresh_token": res.session.refresh_token,
+                }
+                st.rerun()
+            except Exception as e:
+                st.error(f"Sign in failed: {e}")
+
+        st.caption("Forgot password? Send a reset link below.")
+        reset_email = st.text_input("Email for reset link")
+        if st.button("Send reset link"):
+            try:
+                sb.auth.reset_password_email(
+                    reset_email,
+                    options={"redirect_to": resolve_redirect_url()}
+                )
+            except Exception as e:
+                st.error(f"Reset failed: {e}")
+            else:
+                st.success("Password reset email sent. Click it and set a new password.")
 
     # --- Magic Link ---
-    with tabs[0]:
+    with tabs[tab_index["Magic Link"]]:
         st.subheader("Email Magic Link")
         ml_email = st.text_input("Email", key="ml_email")
 
@@ -473,37 +557,8 @@ def auth_ui(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
                 except Exception as e:
                     st.error(f"Token import failed: {e}")
 
-    # --- Password Sign-in ---
-    with tabs[1]:
-        st.subheader("Password Sign in")
-        email = st.text_input("Email", key="signin_email")
-        password = st.text_input("Password", type="password", key="signin_pw")
-        if st.button("Sign in"):
-            try:
-                res = sb.auth.sign_in_with_password({"email": email, "password": password})
-                st.session_state["sb_session"] = {
-                    "access_token": res.session.access_token,
-                    "refresh_token": res.session.refresh_token,
-                }
-                st.rerun()
-            except Exception as e:
-                st.error(f"Sign in failed: {e}")
-
-        st.caption("Forgot password? Send a reset link below.")
-        reset_email = st.text_input("Email for reset link")
-        if st.button("Send reset link"):
-            try:
-                sb.auth.reset_password_email(
-                    reset_email,
-                    options={"redirect_to": resolve_redirect_url()}
-                )
-            except Exception as e:
-                st.error(f"Reset failed: {e}")
-            else:
-                st.success("Password reset email sent. Click it and set a new password.")
-
     # --- OAuth (optional) ---
-    with tabs[2]:
+    with tabs[tab_index["OAuth"]]:
         st.subheader("Social sign-in")
         st.caption("Enable providers in Supabase → Authentication → Providers.")
         col1, col2 = st.columns(2)
