@@ -1,539 +1,362 @@
-# pages/fish_view_aggrid_feature_summary_linked.py
-# ------------------------------------------------------------
-# Auth-protected user page (RLS enforced via anon client from auth.py)
-# Requires:
-#   pip install streamlit-aggrid
-#   (and in requirements.txt: streamlit-aggrid)
-# ------------------------------------------------------------
+# pages/fish_create_2.py
 from __future__ import annotations
 
-import os
-from typing import Optional, List, Dict
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from datetime import date
 
-import pandas as pd
 import streamlit as st
+import pandas as pd
 from postgrest.exceptions import APIError
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
-# --- Auth gate (uses anon client; RLS applies) ---
-from auth import auth_ui, sign_out
+# ================== Layout: wider by ~25% ====================================
+st.set_page_config(layout="wide")
+st.markdown(
+    """
+    <style>
+      .block-container { max-width: 85vw !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-st.set_page_config(page_title="Fish (Feature Summary from Links)", page_icon="🐟", layout="wide")
-st.title("🐟 Fish — Feature Summary (from linked tables)")
+# ===== Supabase client helper ================================================
+from auth import get_supabase  # cached Supabase client
 
-# Block until signed in; returns anon-key client (RLS) + user dict
-sb, user = auth_ui()
 
-# Optional sign out on this page
-with st.sidebar:
-    st.markdown("**Session**")
-    st.caption(f"Signed in as **{user['email']}**")
-    if st.button("Sign out"):
-        sign_out(sb)
-        st.rerun()
+# ===== Data model ============================================================
+@dataclass
+class Fish:
+    id: int
+    name: Optional[str] = None
+    date_birth: Optional[str] = None
+    notes: Optional[str] = None
+    mother_fish_id: Optional[int] = None
+    father_fish_id: Optional[int] = None
+    line_building_stage: Optional[str] = None
+    fish_code: Optional[str] = None
+    created_at: Optional[str] = None
+    created_by: Optional[str] = None
 
-# ------------------------------
-# Session state (for parent selection & entry buffer)
-# ------------------------------
-if "parent_mother_id" not in st.session_state:
-    st.session_state.parent_mother_id = None
-if "parent_father_id" not in st.session_state:
-    st.session_state.parent_father_id = None
 
-# ------------------------------
-# Helpers
-# ------------------------------
-@st.cache_data(ttl=60)
-def fetch_fish(limit: int = 500) -> pd.DataFrame:
+# ===== Helpers: auth refresh + retry on JWT expired ===========================
+def _retry_with_refresh(run_query, *, clear_caches=None):
+    sb = get_supabase()
     try:
-        resp = sb.table("fish").select("*").order("created_at", desc=True).limit(limit).execute()
-        return pd.DataFrame(resp.data or [])
-    except Exception as e:
-        st.error(f"Error fetching fish: {e}")
-        return pd.DataFrame()
-
-def normalize_selection(sel):
-    if isinstance(sel, pd.DataFrame):
-        return sel.to_dict(orient="records")
-    return sel or []
-
-def _uniq_preserve(seq):
-    seen = set(); out = []
-    for x in seq:
-        if x and x not in seen:
-            seen.add(x); out.append(x)
-    return out
-
-def global_filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    """Case-insensitive literal substring match across ALL columns."""
-    if not (query or "").strip():
-        return df
-    mask = df.astype(str).apply(lambda s: s.str.contains(query, case=False, na=False, regex=False))
-    return df[mask.any(axis=1)]
-
-# ---- Linked fetchers (return lists of dicts) ----
-@st.cache_data(ttl=60)
-def linked_transgenes(fish_id: int) -> List[Dict]:
-    r = (
-        sb.table("fish_transgenes")
-          .select("transgenes(id,name,plasmid_id,notes,plasmids(name,marker,resistance))")
-          .eq("fish_id", fish_id).execute()
-    )
-    rows = r.data or []
-    out: List[Dict] = []
-    for row in rows:
-        tg = row.get("transgenes") or {}
-        pl = tg.get("plasmids") or {}
-        out.append({
-            "name": tg.get("name"),
-            "transgene_notes": tg.get("notes"),   # <-- notes from transgenes
-            "plasmid_name": pl.get("name"),
-            "marker": pl.get("marker"),
-            "resistance": pl.get("resistance"),
-        })
-    return out
-
-@st.cache_data(ttl=60)
-def linked_mutations(fish_id: int) -> List[Dict]:
-    r = (sb.table("fish_mutations")
-           .select("mutations(id,name,gene,notes)")
-           .eq("fish_id", fish_id).execute())
-    rows = r.data or []
-    out: List[Dict] = []
-    for row in rows:
-        mu = row.get("mutations") or {}
-        out.append({"name": mu.get("name"), "gene": mu.get("gene"), "notes": mu.get("notes")})
-    return out
-
-@st.cache_data(ttl=60)
-def linked_treatments(fish_id: int) -> List[Dict]:
-    r = (sb.table("fish_treatments")
-           .select("treatments(id,treatment_type,treatment_name,notes)")
-           .eq("fish_id", fish_id).execute())
-    rows = r.data or []
-    out: List[Dict] = []
-    for row in rows:
-        tr = row.get("treatments") or {}
-        out.append({
-            "treatment_type": tr.get("treatment_type"),
-            "treatment_name": tr.get("treatment_name"),
-            "notes": tr.get("notes"),
-        })
-    return out
-
-@st.cache_data(ttl=60)
-def linked_strains(fish_id: int) -> List[Dict]:
-    r = (sb.table("fish_strains")
-           .select("strains(id,name,notes)")
-           .eq("fish_id", fish_id).execute())
-    rows = r.data or []
-    out: List[Dict] = []
-    for row in rows:
-        stn = row.get("strains") or {}
-        out.append({"name": stn.get("name"), "notes": stn.get("notes")})
-    return out
-
-# ---- Formatters ----
-def fmt_transgene_notes(rows: List[Dict]) -> str:
-    parts = []
-    for r in rows:
-        name = (r.get("name") or "").strip()
-        note = (r.get("transgene_notes") or "").strip()
-        if note:
-            parts.append(f"{name + ': ' if name else ''}{note}")
-    return "; ".join(_uniq_preserve(parts))
-
-def fmt_mutations(rows: List[Dict]) -> str:
-    parts = []
-    for r in rows:
-        name = r.get("name"); gene = r.get("gene")
-        parts.append(name if not gene else f"{name} ({gene})")
-    return "; ".join(_uniq_preserve(parts))
-
-def fmt_treatments(rows: List[Dict]) -> str:
-    parts = []
-    for r in rows:
-        t = r.get("treatment_type"); n = r.get("treatment_name")
-        if t and n: parts.append(f"{t}: {n}")
-        elif n: parts.append(n)
-        elif t: parts.append(str(t))
-    return "; ".join(_uniq_preserve(parts))
-
-def fmt_strains(rows: List[Dict]) -> str:
-    return "; ".join(_uniq_preserve([r.get("name") for r in rows if r.get("name")]))
-
-def build_feature_row(row_dict: Dict) -> Dict:
-    fid = row_dict.get("id")
-    out: Dict = {
-        "id": row_dict.get("id"),
-        "name": row_dict.get("name"),
-        "date_birth": row_dict.get("date_birth"),
-        "line_building_stage": row_dict.get("line_building_stage"),
-    }
-    if fid is None:
-        out.update({"transgene_notes": "", "mutations": "", "treatments": "", "strains": ""})
-        return out
-
-    tg_rows = linked_transgenes(int(fid))
-    mu_rows = linked_mutations(int(fid))
-    tr_rows = linked_treatments(int(fid))
-    stn_rows = linked_strains(int(fid))
-
-    out.update({
-        "transgene_notes": fmt_transgene_notes(tg_rows),
-        "mutations": fmt_mutations(mu_rows),
-        "treatments": fmt_treatments(tr_rows),
-        "strains": fmt_strains(stn_rows),
-    })
-    return out
-
-# ---- DB helpers: find/create & safe links ----
-def _find_one(table: str, filters: Dict, select_cols: str = "id"):
-    q = sb.table(table).select(select_cols)
-    for k, v in filters.items():
-        q = q.eq(k, v)
-    res = q.limit(1).execute()
-    rows = res.data or []
-    return rows[0] if rows else None
-
-def _insert_returning_id(table: str, payload: Dict) -> Optional[int]:
-    res = sb.table(table).insert(payload).execute()
-    row = (res.data or [{}])[0]
-    return row.get("id")
-
-def get_or_create_by_name(table: str, name_field: str, name_val: str, extra: Optional[Dict] = None) -> Optional[int]:
-    """Simple name-based upsert for lookup tables (mutations, transgenes, strains)."""
-    if not name_val:
-        return None
-    row = _find_one(table, {name_field: name_val}, select_cols="id")
-    if row:
-        return row.get("id")
-    payload = {name_field: name_val}
-    if extra:
-        payload.update(extra)
-    return _insert_returning_id(table, payload)
-
-def get_or_create_treatment(treatment_type: Optional[str], treatment_name: Optional[str], notes: Optional[str]) -> Optional[int]:
-    """Match on (treatment_type, treatment_name)."""
-    if not treatment_name and not treatment_type:
-        return None
-    filters = {}
-    if treatment_type:
-        filters["treatment_type"] = treatment_type
-    if treatment_name:
-        filters["treatment_name"] = treatment_name
-    row = _find_one("treatments", filters, select_cols="id")
-    if row:
-        return row.get("id")
-    payload = {"treatment_type": treatment_type, "treatment_name": treatment_name, "notes": notes}
-    return _insert_returning_id("treatments", payload)
-
-def safe_link_upsert(table: str, payload: Dict, on_conflict: str):
-    """Upsert a join row (e.g., fish_mutations) using on_conflict to avoid duplicate key errors."""
-    try:
-        sb.table(table).upsert(payload, on_conflict=on_conflict).execute()
+        return run_query(sb)
     except APIError as e:
-        st.warning(f"Link upsert on {table} failed: {e}")
-
-# ------------------------------
-# Main display
-# ------------------------------
-df = fetch_fish(limit=500)
-if df.empty:
-    st.info("No fish found."); st.stop()
-
-if "created_at" in df.columns:
-    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
-
-# Sidebar filters
-st.sidebar.header("🔎 Filters")
-global_q = st.sidebar.text_input("Global search (all columns)", placeholder="e.g. 'cmv', 'amp', '2025-08-29'")
-name_filter = st.sidebar.text_input("Name contains")
-stage_filter = st.sidebar.text_input("Line building stage contains")
-
-filtered = df.copy()
-filtered = global_filter_df(filtered, global_q)
-if name_filter and "name" in filtered.columns:
-    filtered = filtered[filtered["name"].str.contains(name_filter, case=False, na=False)]
-if stage_filter and "line_building_stage" in filtered.columns:
-    filtered = filtered[filtered["line_building_stage"].str.contains(stage_filter, case=False, na=False)]
-
-st.subheader(f"Showing {len(filtered)} of {len(df)} fish")
-
-# Reorder & fixed-height grid
-filtered = filtered.reset_index(drop=True)
-front = [c for c in ["id", "name", "date_birth", "line_building_stage", "created_at"] if c in filtered.columns]
-rest = [c for c in filtered.columns if c not in front]
-filtered = filtered[front + rest]
-
-gob = GridOptionsBuilder.from_dataframe(filtered)
-gob.configure_default_column(resizable=True, sortable=True, filter=True)
-gob.configure_selection(selection_mode="multiple", use_checkbox=True)
-gob.configure_grid_options(
-    rowSelection="multiple",
-    rowMultiSelectWithClick=True,
-    suppressRowClickSelection=False,
-    domLayout="normal",
-    pagination=True,
-    paginationPageSize=25,
-)
-
-grid = AgGrid(
-    filtered,
-    gridOptions=gob.build(),
-    update_mode=GridUpdateMode.SELECTION_CHANGED,
-    allow_unsafe_jscode=False,
-    theme="balham",
-    fit_columns_on_grid_load=True,
-    height=420,
-)
-
-sel_raw = grid.get("selected_rows", [])
-selected_rows = normalize_selection(sel_raw)
-
-# ------------------------------
-# Parent Selection UI
-# ------------------------------
-st.divider()
-st.subheader("👪 Select Parents (choose two, then assign mother/father)")
-
-if len(selected_rows) == 0:
-    st.caption("👈 Select **two** rows above to enable parent assignment.")
-elif len(selected_rows) == 1:
-    st.warning("Select one more fish to assign mother and father.")
-elif len(selected_rows) > 2:
-    st.error("Please select **exactly two** fish to assign parents.")
-else:
-    def label_for(r: Dict) -> str:
-        rid = r.get("id")
-        nm = r.get("name") or f"Fish {rid}"
-        stage = r.get("line_building_stage") or ""
-        db = r.get("date_birth") or ""
-        meta = " · ".join([x for x in [str(db), stage] if x])
-        return f"{nm} [id={rid}]" if not meta else f"{nm} [id={rid}] — {meta}"
-
-    options = {label_for(r): r.get("id") for r in selected_rows}
-    ids = list(options.values())
-
-    default_mother = st.session_state.parent_mother_id or (ids[0] if ids else None)
-    default_father = st.session_state.parent_father_id or (ids[1] if len(ids) > 1 else None)
-    if default_mother == default_father and len(ids) == 2:
-        default_mother, default_father = ids[0], ids[1]
-
-    c1, c2, c3 = st.columns([1.2, 1.2, 0.6])
-    with c1:
-        mother_label = st.selectbox(
-            "Mother",
-            options=list(options.keys()),
-            index=list(options.values()).index(default_mother) if default_mother in options.values() else 0,
-            key="mother_select_label",
-        )
-        chosen_mother_id = options[mother_label]
-    with c2:
-        father_choices = {k: v for k, v in options.items() if v != chosen_mother_id}
-        father_label = st.selectbox(
-            "Father",
-            options=list(father_choices.keys()),
-            index=0 if default_father not in father_choices.values() else list(father_choices.values()).index(default_father),
-            key="father_select_label",
-        )
-        chosen_father_id = father_choices[father_label]
-    with c3:
-        if st.button("↔️ Swap"):
-            st.session_state.parent_mother_id = chosen_father_id
-            st.session_state.parent_father_id = chosen_mother_id
+        msg = str(e)
+        code = getattr(e, "code", None)
+        if "JWT expired" in msg or code == "PGRST303":
             try:
-                st.rerun()
-            except AttributeError:
-                st.experimental_rerun()
+                sb.auth.refresh_session()
+            except Exception:
+                pass
+            if clear_caches:
+                for f in clear_caches:
+                    try: f.clear()
+                    except Exception: pass
+            return run_query(sb)
+        raise
 
-    st.session_state.parent_mother_id = chosen_mother_id
-    st.session_state.parent_father_id = chosen_father_id
 
-    def row_by_id(fid: int) -> Dict:
-        for r in selected_rows:
-            if r.get("id") == fid:
-                return r
-        return {}
-
-    mrow = row_by_id(chosen_mother_id)
-    frow = row_by_id(chosen_father_id)
-    st.success(
-        f"✅ Assigned **Mother**: {mrow.get('name', '—')} (id={chosen_mother_id})  |  "
-        f"**Father**: {frow.get('name', '—')} (id={chosen_father_id})"
-    )
-
-    with st.expander("Parent IDs (for use elsewhere)"):
-        st.code(
-            {
-                "mother_fish_id": st.session_state.parent_mother_id,
-                "father_fish_id": st.session_state.parent_father_id,
-            },
-            language="json",
-        )
-
-# ------------------------------
-# Feature Summary (from linked tables)
-# ------------------------------
-st.divider()
-st.subheader("🐟 Feature Summary (from linked tables)")
-
-if not selected_rows:
-    st.caption("👈 Select one or more rows above to populate the summary.")
-else:
-    summary_rows = [build_feature_row(r) for r in selected_rows]
-    summary_df = pd.DataFrame(summary_rows)
-
-    summary_cols = [
-        "id", "name", "date_birth", "line_building_stage",
-        "transgene_notes", "mutations", "treatments", "strains"
-    ]
-    summary_df = summary_df[[c for c in summary_cols if c in summary_df.columns]]
-    summary_df = summary_df.where(pd.notnull(summary_df), None)
-
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-    csv = summary_df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download feature summary (CSV)", csv, "fish_feature_summary.csv", "text/csv")
-
-# ------------------------------
-# ➕ Quick Create: single-row entry table
-# ------------------------------
-st.divider()
-st.subheader("➕ Create New Fish (quick entry)")
-
-def _init_entry_df() -> pd.DataFrame:
-    # Correct dtypes: date as datetime64[ns]
-    return pd.DataFrame(
-        {
-            "name": pd.Series([""], dtype="string"),
-            "date_birth": pd.Series([pd.NaT], dtype="datetime64[ns]"),
-            "notes": pd.Series([""], dtype="string"),
-            "mutation_name": pd.Series([""], dtype="string"),
-            "transgene_name": pd.Series([""], dtype="string"),
-            "strain_name": pd.Series([""], dtype="string"),
-            "treatment_type": pd.Series([""], dtype="string"),
-            "treatment_name": pd.Series([""], dtype="string"),
-            "treatment_notes": pd.Series([""], dtype="string"),
-        }
-    )
-
-if "new_fish_entry_df" not in st.session_state:
-    st.session_state.new_fish_entry_df = _init_entry_df()
-else:
-    st.session_state.new_fish_entry_df["date_birth"] = pd.to_datetime(
-        st.session_state.new_fish_entry_df["date_birth"], errors="coerce"
-    )
-
-edited_df = st.data_editor(
-    st.session_state.new_fish_entry_df,
-    num_rows="fixed",
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "name": st.column_config.TextColumn("name"),
-        "date_birth": st.column_config.DateColumn("date_birth"),
-        "notes": st.column_config.TextColumn("notes"),
-        "mutation_name": st.column_config.TextColumn("mutation_name"),
-        "transgene_name": st.column_config.TextColumn("transgene_name"),
-        "strain_name": st.column_config.TextColumn("strain_name"),
-        "treatment_type": st.column_config.TextColumn("treatment_type"),
-        "treatment_name": st.column_config.TextColumn("treatment_name"),
-        "treatment_notes": st.column_config.TextColumn("treatment_notes"),
-    },
-    key="new_fish_entry_editor",
+# ===== Cached reads (fish) ===================================================
+FISH_COLS = (
+    "id, name, date_birth, notes, mother_fish_id, father_fish_id, "
+    "line_building_stage, fish_code, created_at, created_by"
 )
 
-c_new1, c_new2 = st.columns([1, 1])
-with c_new1:
-    use_selected_parents = st.checkbox(
-        "Use assigned mother/father from above (if set)",
-        value=True if (st.session_state.parent_mother_id or st.session_state.parent_father_id) else False,
-    )
-with c_new2:
-    create_clicked = st.button("Create Fish", type="primary")
+@st.cache_data(show_spinner=False, ttl=60)
+def list_fish(limit: int = 500) -> pd.DataFrame:
+    def _call(sb):
+        return sb.table("fish").select(FISH_COLS).order("id", desc=True).limit(limit).execute()
+    resp = _retry_with_refresh(_call, clear_caches=[list_fish, get_fish_by_ids,
+                                                   linked_treatments, linked_transgenes, linked_mutations])
+    rows = resp.data or []
+    df = pd.DataFrame(rows)
+    if "created_at" in df:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    if "date_birth" in df:
+        df["date_birth"] = pd.to_datetime(df["date_birth"], errors="coerce").dt.date
+    return df
 
-if create_clicked:
-    try:
-        row = edited_df.iloc[0].to_dict()
 
-        # --- Validate required fields ---
-        name = (row.get("name") or "").strip()
-        if not name:
-            st.error("Please provide a fish 'name' before creating.")
-            st.stop()
+@st.cache_data(show_spinner=False, ttl=60)
+def get_fish_by_ids(ids: List[int]) -> List[Fish]:
+    if not ids: return []
+    def _call(sb):
+        return sb.table("fish").select(FISH_COLS).in_("id", ids).execute()
+    resp = _retry_with_refresh(_call, clear_caches=[list_fish, get_fish_by_ids,
+                                                   linked_treatments, linked_transgenes, linked_mutations])
+    rows = resp.data or []
+    return [Fish(**r) for r in rows]
 
-        # Normalize date to YYYY-MM-DD
-        raw_db = row.get("date_birth")
-        if pd.isna(raw_db):
-            date_birth_iso = None
+
+# ===== Linked fetchers with namespaced fields ================================
+@st.cache_data(show_spinner=False, ttl=60)
+def linked_treatments(fish_id: int) -> List[Dict[str, Any]]:
+    def _call(sb):
+        return (
+            sb.table("fish_treatments")
+            .select("fish_id, treatment_id, treatments(id, name, type, description)")
+            .eq("fish_id", fish_id)
+            .execute()
+        )
+    resp = _retry_with_refresh(_call)
+    out: List[Dict[str, Any]] = []
+    for r in resp.data or []:
+        tr = r.get("treatments") or {}
+        out.append({
+            "category": "Treatment",
+            "treatment_id": tr.get("id"),
+            "treatment_name": tr.get("name"),
+            "treatment_type": tr.get("type"),
+            "treatment_description": tr.get("description"),
+            "inherit": False,
+        })
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def linked_transgenes(fish_id: int) -> List[Dict[str, Any]]:
+    def _call(sb):
+        return (
+            sb.table("fish_transgenes")
+            .select("fish_id, transgene_id, transgenes(id, name, type, description)")
+            .eq("fish_id", fish_id)
+            .execute()
+        )
+    resp = _retry_with_refresh(_call)
+    out: List[Dict[str, Any]] = []
+    for r in resp.data or []:
+        tg = r.get("transgenes") or {}
+        out.append({
+            "category": "Transgene",
+            "transgene_id": tg.get("id"),
+            "transgene_name": tg.get("name"),
+            "transgene_type": tg.get("type"),
+            "transgene_description": tg.get("description"),
+            "inherit": False,
+        })
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def linked_mutations(fish_id: int) -> List[Dict[str, Any]]:
+    def _call(sb):
+        return (
+            sb.table("fish_mutations")
+            .select("fish_id, mutation_id, mutations(id, name)")
+            .eq("fish_id", fish_id)
+            .execute()
+        )
+    resp = _retry_with_refresh(_call)
+    out: List[Dict[str, Any]] = []
+    for r in resp.data or []:
+        mu = r.get("mutations") or {}
+        out.append({
+            "category": "Mutation",
+            "mutation_id": mu.get("id"),
+            "mutation_name": mu.get("name"),
+            "inherit": False,
+        })
+    return out
+
+
+# ===== Inserts ===============================================================
+def _make_new_fish_payload(
+    name: Optional[str], date_birth: Optional[date], notes: Optional[str],
+    line_building_stage: Optional[str], fish_code: Optional[str],
+    mother_fish_id: Optional[int], father_fish_id: Optional[int],
+) -> Dict[str, Any]:
+    p = {}
+    if name: p["name"] = name
+    if date_birth: p["date_birth"] = date_birth.isoformat()
+    if notes: p["notes"] = notes
+    if line_building_stage: p["line_building_stage"] = line_building_stage
+    if fish_code: p["fish_code"] = fish_code
+    if mother_fish_id: p["mother_fish_id"] = mother_fish_id
+    if father_fish_id: p["father_fish_id"] = father_fish_id
+    return p
+
+
+def create_fish(payload: Dict[str, Any]) -> Optional[int]:
+    def _call(sb):
+        return sb.table("fish").insert(payload).select("id").execute()
+    resp = _retry_with_refresh(_call)
+    data = resp.data or []
+    return data[0].get("id") if data else None
+
+
+def insert_links(table: str, rows: List[Dict[str, Any]]) -> None:
+    if not rows: return
+    def _call(sb):
+        return sb.table(table).insert(rows).execute()
+    _retry_with_refresh(_call)
+
+
+def create_treatment(name: str, ttype: Optional[str], desc: Optional[str]) -> int:
+    """Create a brand-new treatment and return its ID."""
+    payload = {"name": name}
+    if ttype: payload["type"] = ttype
+    if desc: payload["description"] = desc
+
+    def _call(sb):
+        return sb.table("treatments").insert(payload).select("id").execute()
+    resp = _retry_with_refresh(_call)
+    data = resp.data or []
+    if not data:
+        raise RuntimeError("Treatment create returned no ID")
+    return int(data[0]["id"])
+
+
+# ===== UI builders ============================================================
+def _parent_picker(df_all: pd.DataFrame) -> Tuple[Optional[int], Optional[int]]:
+    st.markdown("**Select parents:**")
+    parent_df = df_all[["id","name","fish_code","date_birth"]] if not df_all.empty else pd.DataFrame()
+    parent_df = parent_df.sort_values("id", ascending=False).reset_index(drop=True)
+    parent_df["Mother"] = False
+    parent_df["Father"] = False
+    edited = st.data_editor(parent_df, hide_index=True, use_container_width=True, key="parent_picker")
+    m_ids = edited.loc[edited["Mother"], "id"].tolist() if "Mother" in edited else []
+    f_ids = edited.loc[edited["Father"], "id"].tolist() if "Father" in edited else []
+    return (m_ids[0] if len(m_ids)==1 else None, f_ids[0] if len(f_ids)==1 else None)
+
+
+def _parent_links_df(fish_id: Optional[int]) -> pd.DataFrame:
+    if not fish_id: return pd.DataFrame()
+    rows = linked_treatments(fish_id) + linked_transgenes(fish_id) + linked_mutations(fish_id)
+    df = pd.DataFrame(rows)
+    # Nice ordering
+    cat_order = {"Treatment":0, "Transgene":1, "Mutation":2}
+    if not df.empty:
+        df["__o"] = df["category"].map(cat_order).fillna(9)
+        df = df.sort_values(["__o"], ascending=[True]).drop(columns="__o")
+    return df
+
+
+def _parent_links_editor(df: pd.DataFrame, key: str):
+    if df.empty:
+        st.caption("No linked items.")
+        return df
+    cfg = {}
+    for col in df.columns:
+        # Make all non-boolean columns read-only
+        if col == "inherit":
+            cfg[col] = st.column_config.CheckboxColumn("Inherit")
         else:
-            db_ts = pd.to_datetime(raw_db, errors="coerce")
-            date_birth_iso = None if pd.isna(db_ts) else db_ts.date().isoformat()
+            cfg[col] = st.column_config.TextColumn(col.replace("_", " ").title(), disabled=True)
+    return st.data_editor(df, key=key, hide_index=True, use_container_width=True, num_rows="fixed", column_config=cfg)
 
-        notes = (row.get("notes") or "").strip() or None
 
-        mutation_name = (row.get("mutation_name") or "").strip() or None
-        transgene_name = (row.get("transgene_name") or "").strip() or None
-        strain_name = (row.get("strain_name") or "").strip() or None
+# ===== Page layout ============================================================
+def main():
+    st.title("Build a new fish from selected parents")
 
-        treatment_type = (row.get("treatment_type") or "").strip() or None
-        treatment_name = (row.get("treatment_name") or "").strip() or None
-        treatment_notes = (row.get("treatment_notes") or "").strip() or None
+    # Step 1: Choose parents
+    df_all = list_fish(limit=500)
+    mother_id, father_id = _parent_picker(df_all)
 
-        # --- Create fish (RLS enforced via anon client) ---
-        fish_payload = {"name": name, "date_birth": date_birth_iso, "notes": notes}
-        if use_selected_parents:
-            if st.session_state.parent_mother_id:
-                fish_payload["mother_fish_id"] = st.session_state.parent_mother_id
-            if st.session_state.parent_father_id:
-                fish_payload["father_fish_id"] = st.session_state.parent_father_id
+    st.divider()
+    st.subheader("Parent links (inheritance)")
 
-        fish_res = sb.table("fish").insert(fish_payload).execute()
-        new_fish = (fish_res.data or [{}])[0]
-        fish_id = new_fish.get("id")
-        if not fish_id:
-            raise RuntimeError("Fish was not created (no id returned).")
+    colL, colR = st.columns(2)
+    with colL:
+        st.markdown("**Mother**")
+        m_df = _parent_links_df(mother_id)
+        _parent_links_editor(m_df, "mother_links")
 
-        # --- Lookups & Links (safe upserts) ---
-        if mutation_name:
-            mutation_id = get_or_create_by_name("mutations", "name", mutation_name)
-            if mutation_id:
-                safe_link_upsert("fish_mutations", {"fish_id": fish_id, "mutation_id": mutation_id}, on_conflict="fish_id,mutation_id")
+    with colR:
+        st.markdown("**Father**")
+        f_df = _parent_links_df(father_id)
+        _parent_links_editor(f_df, "father_links")
 
-        if transgene_name:
-            transgene_id = get_or_create_by_name("transgenes", "name", transgene_name)
-            if transgene_id:
-                safe_link_upsert("fish_transgenes", {"fish_id": fish_id, "transgene_id": transgene_id}, on_conflict="fish_id,transgene_id")
+    st.divider()
+    st.subheader("New fish details")
 
-        if strain_name:
-            strain_id = get_or_create_by_name("strains", "name", strain_name)
-            if strain_id:
-                safe_link_upsert("fish_strains", {"fish_id": fish_id, "strain_id": strain_id}, on_conflict="fish_id,strain_id")
+    name = st.text_input("Name")
+    fish_code = st.text_input("Fish code")
+    date_birth = st.date_input("Birth date", value=None, format="YYYY-MM-DD")
+    line_stage = st.text_input("Line-building stage")
+    notes = st.text_area("Notes")
 
-        if treatment_type or treatment_name or treatment_notes:
-            treatment_id = get_or_create_treatment(treatment_type, treatment_name, treatment_notes)
-            if treatment_id:
-                safe_link_upsert("fish_treatments", {"fish_id": fish_id, "treatment_id": treatment_id}, on_conflict="fish_id,treatment_id")
+    # ---- New Treatment at creation ------------------------------------------
+    st.markdown("### Optional: Add a brand-new treatment to this fish")
+    with st.container(border=True):
+        add_new_tr = st.checkbox("Add a new treatment", value=False)
+        tr_name = tr_type = tr_desc = None
+        if add_new_tr:
+            tr_cols = st.columns([2, 1, 2])
+            with tr_cols[0]:
+                tr_name = st.text_input("Treatment name*", key="new_tr_name", placeholder="e.g., Heat Shock 37°C")
+            with tr_cols[1]:
+                tr_type = st.text_input("Treatment type", key="new_tr_type", placeholder="e.g., thermal")
+            with tr_cols[2]:
+                tr_desc = st.text_input("Treatment description", key="new_tr_desc", placeholder="Optional notes…")
+            st.caption("Leave unchecked to skip. Only 'Treatment name' is required if adding.")
 
-        st.success(f"✅ Created fish '{name}' (id={fish_id}) and linked features.")
-        st.session_state.new_fish_entry_df = _init_entry_df()
-        fetch_fish.clear()  # refresh cache
+    # Create
+    if st.button("Create new fish", type="primary"):
         try:
-            st.rerun()
-        except AttributeError:
-            st.experimental_rerun()
+            # 1) Create fish
+            payload = _make_new_fish_payload(
+                name=name or None,
+                date_birth=date_birth,
+                notes=notes or None,
+                line_building_stage=line_stage or None,
+                fish_code=fish_code or None,
+                mother_fish_id=mother_id,
+                father_fish_id=father_id,
+            )
+            new_id = create_fish(payload)
+            if not new_id:
+                st.error("Failed to create fish")
+                return
 
-    except Exception as e:
-        st.error(f"Error creating fish: {e}")
+            # 2) Collect inherited links (from parents)
+            def _collect_ids(key: str, category: str, idcol: str) -> List[int]:
+                df = st.session_state.get(key)
+                if isinstance(df, pd.DataFrame) and {"inherit","category",idcol}.issubset(df.columns):
+                    sub = df[(df["inherit"] == True) & (df["category"] == category)]
+                    return sub[idcol].dropna().astype(int).tolist()
+                return []
 
-# ------------------------------
-# (Optional) Admin-only section (service role) — disabled by default
-# ------------------------------
-# If you truly need service-role actions on this page, uncomment below and set ADMIN_EMAILS env var.
-# from supabase_client import get_client
-# ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
-# if user["email"].lower() in ADMIN_EMAILS:
-#     sb_admin = get_client()
-#     st.info("🛠 Admin mode enabled (service role). Use with caution: bypasses RLS.")
-#     # e.g., sb_admin.table("...").delete().eq(...).execute()
+            tr_ids = list(set(
+                _collect_ids("mother_links", "Treatment", "treatment_id") +
+                _collect_ids("father_links", "Treatment", "treatment_id")
+            ))
+            tg_ids = list(set(
+                _collect_ids("mother_links", "Transgene", "transgene_id") +
+                _collect_ids("father_links", "Transgene", "transgene_id")
+            ))
+            mu_ids = list(set(
+                _collect_ids("mother_links", "Mutation", "mutation_id") +
+                _collect_ids("father_links", "Mutation", "mutation_id")
+            ))
+
+            # 3) If requested, create a brand-new treatment and queue it to link
+            if add_new_tr and tr_name:
+                try:
+                    new_tr_id = create_treatment(tr_name.strip(), (tr_type or None), (tr_desc or None))
+                    tr_ids.append(new_tr_id)
+                except Exception as e:
+                    st.warning(f"New treatment not created: {e}")
+
+            # 4) Insert link rows
+            if tr_ids:
+                insert_links("fish_treatments", [{"fish_id": new_id, "treatment_id": i} for i in tr_ids])
+            if tg_ids:
+                insert_links("fish_transgenes", [{"fish_id": new_id, "transgene_id": i} for i in tg_ids])
+            if mu_ids:
+                insert_links("fish_mutations", [{"fish_id": new_id, "mutation_id": i} for i in mu_ids])
+
+            st.success(
+                f"Created fish #{new_id} "
+                f"(+ {len(tr_ids)} treatments, {len(tg_ids)} transgenes, {len(mu_ids)} mutations linked)."
+            )
+        except Exception as e:
+            st.error(f"Create failed: {e}")
+
+
+if __name__ == "__main__":
+    main()

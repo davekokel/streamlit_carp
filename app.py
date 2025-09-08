@@ -1,65 +1,54 @@
 # app.py
 import os
 import streamlit as st
-
-# Auth helpers (make sure auth.py is in the same folder)
 from auth import auth_ui, sign_out
-
-# Your existing helper that returns a service-role client (admin-only!)
 from supabase_client import get_client
 
-# ------------------------------
-# Page config
-# ------------------------------
 st.set_page_config(page_title="Supabase Visualizer", page_icon="🗃️", layout="wide")
 st.title("🗃️ Supabase Visualizer")
 
-# ------------------------------
-# Require sign-in
-# ------------------------------
-# Hint the auth UI to show Password first (if supported), else gracefully fall back.
-# We also set a query param that some auth_ui implementations read.
-qp = st.query_params
-if qp.get("auth") != "password":
-    qp["auth"] = "password"
-    st.query_params = qp  # updates the URL; harmless if unsupported
+if "auth_pref_set" not in st.session_state:
+    st.session_state["auth_pref_set"] = True
+    try:
+        qp = st.query_params
+        qp["auth"] = "password"
+        st.query_params = qp
+        st.stop()
+    except Exception:
+        pass
 
 sb = None
-user = None
-_auth_ex = None
-
+user = {}
 try:
-    # Most likely signature if your auth_ui supports a preferred tab
     sb, user = auth_ui(prefer_password_first=True)
-except TypeError as e:
-    _auth_ex = e
+except TypeError:
     try:
-        # Alternate common kw name
         sb, user = auth_ui(default_tab="password")
-    except TypeError as e2:
-        _auth_ex = e2
-        # Final fallback: original call (Magic link might show first)
+    except TypeError:
         sb, user = auth_ui()
-        st.info(
-            "Password-first hint not supported by your current auth_ui. "
-            "If you want the Password tab to appear first permanently, "
-            "add a parameter like prefer_password_first=True or default_tab='password' in auth.py."
-        )
+        st.info("Password-first hint not supported by current auth_ui.")
 
-# ------------------------------
-# Sidebar: session info & sign-out
-# ------------------------------
+st.components.v1.html("""
+<script>
+setTimeout(() => {
+  const inputs = Array.from(document.querySelectorAll('input'));
+  const email = inputs.find(i => i.type==='text' && /email/i.test(i.getAttribute('aria-label')||''));
+  const user  = inputs.find(i => i.type==='text' && !/email/i.test(i.getAttribute('aria-label')||''));
+  const pw    = inputs.find(i => i.type==='password');
+  if (email){ email.setAttribute('autocomplete','username'); email.setAttribute('name','username'); }
+  if (!email && user){ user.setAttribute('autocomplete','username'); user.setAttribute('name','username'); }
+  if (pw){ pw.setAttribute('autocomplete','current-password'); pw.setAttribute('name','password'); }
+}, 200);
+</script>
+""", height=0)
+
 with st.sidebar:
     st.markdown("**Connection**  \nUses keys from `.streamlit/secrets.toml` or env vars.")
-    st.caption(f"Signed in as **{user['email']}**")
+    st.caption(f"Signed in as **{(user or {}).get('email','')}**")
     if st.button("Sign out"):
         sign_out(sb)
         st.rerun()
 
-# ------------------------------
-# Optional: Admin connection (service role) for allowlisted emails
-# ------------------------------
-# Set ADMIN_EMAILS env var as a comma-separated list (e.g., "you@company.com,admin@org.org")
 ADMIN_EMAILS = {
     e.strip().lower()
     for e in os.environ.get("ADMIN_EMAILS", "").split(",")
@@ -67,18 +56,15 @@ ADMIN_EMAILS = {
 }
 
 sb_admin = None
-if user.get("email", "").lower() in ADMIN_EMAILS:
+if (user or {}).get("email","").lower() in ADMIN_EMAILS:
     try:
-        sb_admin = get_client()  # your existing service-role client
+        sb_admin = get_client()
         st.sidebar.success("Admin (service role) connected ✔")
     except Exception as e:
         st.sidebar.error(f"Admin connection failed: {e}")
 else:
     st.sidebar.info("Standard user mode (RLS enforced)")
 
-# ------------------------------
-# App content (keeps your original UX)
-# ------------------------------
 ok = False
 try:
     sb.table("profiles").select("id").limit(1).execute()
@@ -100,10 +86,6 @@ st.markdown(
     """
 )
 
-# Optional: separate “admin connection ok” check using your original get_client()
 if sb_admin:
     with st.expander("🛠️ Admin tools (service role)"):
         st.write("You have access to admin-only features.")
-        # Example (disabled by default): preview with service role. BE CAREFUL—bypasses RLS!
-        # preview = sb_admin.table("some_table").select("*").limit(5).execute().data
-        # st.write(preview)
