@@ -7,26 +7,19 @@ from supabase_client import get_client
 st.set_page_config(page_title="Supabase Visualizer", page_icon="🗃️", layout="wide")
 st.title("🗃️ Supabase Visualizer")
 
-if "auth_pref_set" not in st.session_state:
-    st.session_state["auth_pref_set"] = True
-    try:
-        qp = st.query_params
-        qp["auth"] = "password"
-        st.query_params = qp
-        st.stop()
-    except Exception:
-        pass
-
 sb = None
 user = {}
+auth_err = None
 try:
-    sb, user = auth_ui(prefer_password_first=True)
-except TypeError:
     try:
-        sb, user = auth_ui(default_tab="password")
+        sb, user = auth_ui(prefer_password_first=True)
     except TypeError:
-        sb, user = auth_ui()
-        st.info("Password-first hint not supported by current auth_ui.")
+        try:
+            sb, user = auth_ui(default_tab="password")
+        except TypeError:
+            sb, user = auth_ui()
+except Exception as e:
+    auth_err = e
 
 st.components.v1.html("""
 <script>
@@ -65,27 +58,40 @@ if (user or {}).get("email","").lower() in ADMIN_EMAILS:
 else:
     st.sidebar.info("Standard user mode (RLS enforced)")
 
-ok = False
-try:
-    sb.table("profiles").select("id").limit(1).execute()
-    ok = True
-except Exception as e:
-    st.info("Tried probing the 'profiles' table to verify connectivity.")
-    st.caption("If your schema doesn't have 'profiles', change the table name below.")
-    st.exception(e)
+placeholder = st.empty()
 
-if ok:
-    st.success("Connected to Supabase ✔ (user session)")
+if auth_err:
+    with placeholder.container():
+        st.error("Authentication component failed to load.")
+        st.exception(auth_err)
+else:
+    ok = False
+    probe_err = None
+    try:
+        if sb is not None:
+            sb.table("profiles").select("id").limit(1).execute()
+            ok = True
+    except Exception as e:
+        probe_err = e
 
-st.markdown(
-    """
-    Use the pages on the left to:
-    - **🔎 Data Explorer**: browse any table, filter, and download CSV.
-    - **📈 Quick Charts**: make simple charts by picking columns.
-    - **🧪 SQL Runner**: run safe `SELECT` queries.
-    """
-)
+    with placeholder.container():
+        if ok:
+            st.success("Connected to Supabase ✔ (user session)")
+        else:
+            st.info("Tried probing the 'profiles' table to verify connectivity.")
+            st.caption("If your schema doesn't have 'profiles', change the table name in app.py.")
+            if probe_err:
+                st.exception(probe_err)
 
-if sb_admin:
-    with st.expander("🛠️ Admin tools (service role)"):
-        st.write("You have access to admin-only features.")
+        st.markdown(
+            """
+            Use the pages on the left to:
+            - **🔎 Data Explorer**: browse any table, filter, and download CSV.
+            - **📈 Quick Charts**: make simple charts by picking columns.
+            - **🧪 SQL Runner**: run safe `SELECT` queries.
+            """
+        )
+
+        if sb_admin:
+            with st.expander("🛠️ Admin tools (service role)"):
+                st.write("You have access to admin-only features.")

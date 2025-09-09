@@ -7,6 +7,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
 
+from utils_env import getenv
+from supabase_client import create_client as _create_client
+
 
 # =========================
 # Config & client helpers
@@ -30,25 +33,19 @@ def _make_client(url: str, key: str) -> Client:
     return create_client(url, key)
 
 
-def get_supabase(anon: bool = True) -> Client:
-    """
-    anon=True  -> anon key (RLS enforced; normal user actions)
-    anon=False -> service-role (BYPASSES RLS; admin-only server ops)
-    """
-    url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
+
+
+def get_supabase(anon=True):
+    url = getenv("SUPABASE_URL")
+    anon_key = getenv("SUPABASE_ANON_KEY")
+    service_key = getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not url:
-        raise RuntimeError("Missing SUPABASE_URL in secrets/env.")
-
-    key = (
-        os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
-        if anon else
-        os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-    )
+        raise RuntimeError("Missing SUPABASE_URL in secrets/env or environment.")
+    key = anon_key if anon else (service_key or anon_key)
     if not key:
-        which = "SUPABASE_ANON_KEY" if anon else "SUPABASE_SERVICE_ROLE_KEY"
-        raise RuntimeError(f"Missing {which} in secrets/env.")
+        raise RuntimeError("Missing Supabase key for selected mode.")
+    return _create_client(url, key)
 
-    return _make_client(url, key)
 
 
 # =========================
