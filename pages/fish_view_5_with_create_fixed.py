@@ -1,4 +1,23 @@
 from __future__ import annotations
+
+import streamlit as st
+from lib.config import make_supabase_client
+
+@st.cache_resource
+def sb_client():
+    return make_supabase_client()
+
+def attach_session():
+    if "sb_access_token" in st.session_state and "sb_refresh_token" in st.session_state:
+        sb_client().auth.set_session(st.session_state["sb_access_token"], st.session_state["sb_refresh_token"])
+
+attach_session()
+if "sb_user" not in st.session_state:
+    st.switch_page("app.py")
+
+sb = sb_client()
+
+
 from typing import Any, Dict, List, Optional
 import streamlit as st
 

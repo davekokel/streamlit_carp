@@ -158,18 +158,30 @@ def _password_reset_form(form_key: str, submit_label: str = "Set password") -> O
 # =========================
 
 def require_auth(debug: bool = False) -> Tuple[Client, Dict[str, Any]]:
-    """
-    Convenience wrapper for pages:
-        sb, user = require_auth()
-    If not authenticated, this will render the auth UI and stop.
-    """
+    """Return (sb, user) if authenticated; otherwise render auth UI and stop."""
+    sb = get_supabase(anon=True)
+    at = st.session_state.get('sb_access_token')
+    rt = st.session_state.get('sb_refresh_token')
+    if at and rt:
+        st.session_state['sb_session'] = {'access_token': at, 'refresh_token': rt}
+        try:
+            sb.auth.set_session(access_token=at, refresh_token=rt)
+        except Exception:
+            pass
+    if 'sb_user' in st.session_state and st.session_state['sb_user']:
+        return sb, st.session_state['sb_user']
+    user = _restore_session(sb)
+    if user:
+        st.session_state['sb_user'] = {'id': user['id'], 'email': user.get('email')}
+        return sb, st.session_state['sb_user']
+    try:
+        u = sb.auth.get_user().user
+        if u:
+            st.session_state['sb_user'] = {'id': u.id, 'email': getattr(u, 'email', None)}
+            return sb, st.session_state['sb_user']
+    except Exception:
+        pass
     return auth_ui(debug=debug)
-
-
-# =========================
-# Main gate UI
-# =========================
-
 def _resolve_default_tab(prefer_password_first: bool, default_tab: Optional[str]) -> str:
     """
     Decide which tab should appear first.
@@ -224,6 +236,26 @@ def auth_ui(
       prefer_password_first: bool      → if True, Password tab is shown first
       default_tab: {'password'|'magic'|'oauth'} → explicit first tab choice
     """
+    # Fast-exit if already authenticated
+    at = st.session_state.get('sb_access_token')
+    rt = st.session_state.get('sb_refresh_token')
+    if at and rt:
+        try:
+            sb = get_supabase(anon=True)
+            sb.auth.set_session(access_token=at, refresh_token=rt)
+            try:
+                u = sb.auth.get_user().user
+                if u:
+                    st.session_state['sb_user'] = {'id': u.id, 'email': getattr(u, 'email', None)}
+                    return sb, st.session_state['sb_user']
+            except Exception:
+                pass
+        except Exception:
+            pass
+    if 'sb_user' in st.session_state and st.session_state['sb_user']:
+        sb = get_supabase(anon=True)
+        return sb, st.session_state['sb_user']
+
     sb = get_supabase(anon=True)
 
     # 1) Client-side fragment catcher -> query params
@@ -245,7 +277,7 @@ def auth_ui(
                   url.searchParams.set("access_token", at);
                   url.searchParams.set("refresh_token", rt);
                   if (typ) url.searchParams.set("type", typ);
-                  window.location.replace(url.toString());
+
                   return;
                 }
               }
