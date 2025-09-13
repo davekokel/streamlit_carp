@@ -19,11 +19,20 @@ def _require_login():
             res = sb.auth.sign_in_with_password({"email": email, "password": pw})
             sess = res.session
             if sess:
+                # Keep generic tokens (used by this gate)
                 st.session_state["_sb_tokens"] = {
                     "access_token": sess.access_token,
                     "refresh_token": sess.refresh_token,
                     "expires_in": int(getattr(sess, "expires_in", 3600) or 3600),
                 }
+                # Set the app's expected session keys so downstream code detects auth
+                try:
+                    st.session_state["sb_access_token"] = sess.access_token
+                    st.session_state["sb_refresh_token"] = sess.refresh_token
+                    u = getattr(res, "user", None)
+                    st.session_state["sb_user"] = {"id": getattr(u, "id", None), "email": (getattr(u, "email", None) or email)}
+                except Exception:
+                    pass
                 st.session_state["_authed"] = True
                 st.success("Logged in")
                 st.rerun()
@@ -41,8 +50,8 @@ def _require_login():
             st.sidebar.info("Enter your email above first.")
 
     if st.sidebar.button("Sign out", key="_signout"):
-        st.session_state.pop("_sb_tokens", None)
-        st.session_state.pop("_email", None)
+        for k in ("_sb_tokens","_email","sb_access_token","sb_refresh_token","sb_user"):
+            st.session_state.pop(k, None)
         st.session_state["_authed"] = False
         st.rerun()
 
@@ -53,6 +62,7 @@ def _require_login():
 
 _sb = _require_login()
 # --- AUTH GATE (Supabase) END ---
+
 
 import os, pathlib, json, datetime as _dt, requests
 import streamlit as st
