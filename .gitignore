@@ -35,3 +35,7 @@ Thumbs.db
 .streamlit/secrets.toml
 
 .streamlit/secrets.toml
+.streamlit/
+*.env
+*.bak.*
+__pycache__/
